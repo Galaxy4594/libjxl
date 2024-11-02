@@ -929,7 +929,7 @@ StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,
   return decoded;
 }
 
-constexpr int kDefaultButteraugliIters = 4;
+constexpr int kDefaultButteraugliIters = 2;
 constexpr int kMaxButteraugliIters = 4;
 
 Status FindBestQuantization(const FrameHeader& frame_header,
