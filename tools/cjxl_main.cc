@@ -463,6 +463,27 @@ struct CompressArgs {
         "0 = don't apply the Squeeze transform. Default for lossless output.\n"
         "    1 = apply the Squeeze transform. Default for lossy output.",
         &responsive, &ParseInt64, 4);
+
+    cmdline->AddOptionValue(
+        'L', "LZ77Method", "0..3",
+        "LZ77 Effort. 0 = kNone. 1 = kRLE. 2 = kLZ77. 3 = kOptimal.",
+        &CHANGE_THIS, &ParseInt64, 4);
+
+cmdline->AddOptionValue(
+        'H', "Huffman_Encoding", "0..1",
+        "Enables Huffman Encoding. 0 = OFF. 1 = ON.",
+        &CHANGE_THIS, &ParseInt64, 4);
+
+cmdline->AddOptionValue(
+        'T', "Tree_Kind", "0..6",
+        "Tree type to use. kTrivialTreeNoPredictor = 0"
+        "kLearn = 1 \n"
+        "kJpegTranscodeACMeta = 2"
+        "kFalconACMeta = 3"
+        "kACMeta = 4 \n" 
+        "kWPFixedDC = 5"
+        "kGradientFixedDC = 6""
+        &CHANGE_THIS, &ParseInt64, 4);
   }
 
   // Common flags.
