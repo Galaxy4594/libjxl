@@ -92,14 +92,13 @@ Start the MINGW64 environment, create a build directory within the source direct
 ```bash
 mkdir build
 cd build
-cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+cmake -DCMAKE_BUILD_TYPE=Release \
    -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF \
    -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_PLUGINS=ON \
-   -DJPEGXL_ENABLE_MANPAGES=OFF -DJPEGXL_FORCE_SYSTEM_BROTLI=ON \
-   -DJPEGXL_FORCE_SYSTEM_GTEST=ON ..
+   -DJPEGXL_ENABLE_MANPAGES=OFF -DJPEGXL_STATIC=ON ..
 ```
 
-Check the output to see if any dependencies were missed and need to be installed.  Adding `-G Ninja` may be helpful, but on my computer, Ninja was selected by default.  Remember that package changes must be done from the MSYS environment.  Then exit all MSYS2 terminals and restart the build environment.
+You could optionally add `-DCMAKE_EXE_LINKER_FLAGS=-s` to strip symbols to reduce the size of the binaries. Check the output to see if any dependencies were missed and need to be installed.  Adding `-G Ninja` may be helpful, but on my computer, Ninja was selected by default.  Remember that package changes must be done from the MSYS environment.  Then exit all MSYS2 terminals and restart the build environment.
 
 If all went well, you may now run `cmake` to build `libjxl`:
 
@@ -130,9 +129,9 @@ mingw-w64-ucrt64-x86_64-clang-compiler-rt
 After the `clang` compiler is installed, 'libjxl' can be built with the `./ci.sh` script.
 
 ```bash
-./ci.sh opt -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF \
+./ci.sh release -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF \
     -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
-    -DJPEGXL_FORCE_SYSTEM_BROTLI=ON -DJPEGXL_FORCE_SYSTEM_GTEST=ON
+    -DJPEGXL_STATIC=ON
 ```
 
 On my computer, `doxygen` packages needed to be installed to proceed with building.  Use `pacman -Ss doxygen` to find the packages to install.
@@ -152,10 +151,10 @@ If `clang` is installed, you can use the `./ci.sh` script to build.  Otherwise, 
 ```bash
 cd build
 rm -r CM*
-cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+cmake -DCMAKE_BUILD_TYPE=Release \
    -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF \
    -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
-   -DJPEGXL_ENABLE_PLUGINS=ON -DJPEGXL_FORCE_SYSTEM_BROTLI=ON \
+   -DJPEGXL_ENABLE_PLUGINS=ON \
    -DJPEGXL_FORCE_SYSTEM_GTEST=ON ..
 ```
 
