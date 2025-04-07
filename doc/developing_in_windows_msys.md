@@ -134,6 +134,16 @@ After the `clang` compiler is installed, 'libjxl' can be built with the `./ci.sh
     -DJPEGXL_STATIC=ON
 ```
 
+If the script doesn't work, navigate to the build directory to reconfigure and build with `cmake`.
+
+```bash
+export CC=clang && export=clang++
+cmake -DCMAKE_BUILD_TYPE=Release \
+   -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF \
+   -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_PLUGINS=ON \
+   -DJPEGXL_ENABLE_MANPAGES=OFF -DJPEGXL_STATIC=ON ..
+```
+
 On my computer, `doxygen` packages needed to be installed to proceed with building.  Use `pacman -Ss doxygen` to find the packages to install.
 
 ## The GIMP Plugin
