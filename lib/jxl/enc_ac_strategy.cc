@@ -429,9 +429,8 @@ static const float kMixLossTable[AcStrategy::kNumValidStrategies] = {
 float EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
                        const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
-                       float* full_scratch_space, uint32_t* quantized,
-                       float& entropy) {
-  entropy = 0.0f;
+                       float* full_scratch_space, uint32_t* quantized) {
+  float entropy = 0.0f;
   float* mem = full_scratch_space;
   float* scratch_space = full_scratch_space + AcStrategy::kMaxCoeffArea;
   const size_t size = (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
@@ -500,7 +499,6 @@ float EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
 
   // Compute entropy.
   entropy = 0.0f; //FLAG: no need to redefine float
-  auto loss = Zero(df8);
   auto info_loss = Zero(df);
   auto info_loss2 = Zero(df);
 
@@ -525,8 +523,7 @@ float EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
       // be punishing large values more than necessary. Sqrt tries
       // to avoid large values less aggressively.
       entropy_v = Add(Sqrt(q), entropy_v);
-      nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, Set(df, 1.0f)));
-      IfThenZeroElse(q_is_zero, Set(df, 1.0f));
+      nzeros_v = Add(nzeros_v, IfThenElse(q_is_zero, Zero(df), Set(df, 1.0f)));
     }
     entropy += config.cost_delta * cmul[c] * GetLane(SumOfLanes(df, entropy_v));
       
@@ -786,43 +783,42 @@ Status FindBestFirstLevelDivisionForSquare(
   float entropy_JXJ = std::numeric_limits<float>::max();
   if (allow_JXK) {
     if (row0[bx + cx + 0].Strategy() != acs_rawJXK) {
-      JXL_RETURN_IF_ERROR(entropy_JXK_left =
+      entropy_JXK_left =
           entropy_mul_JXK *
           EstimateEntropy(acsJXK, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-                          cmap_factors, block, scratch_space, quantized));
+                          cmap_factors, block, scratch_space, quantized);
     }
     if (row0[bx + cx + blocks_half].Strategy() != acs_rawJXK) {
-      JXL_RETURN_IF_ERROR(entropy_JXK_right =
+      entropy_JXK_right =
           entropy_mul_JXK * EstimateEntropy(acsJXK, (bx + cx + blocks_half) * 8,
                                             (by + cy + 0) * 8, config,
                                             cmap_factors, block, scratch_space,
-                                            quantized));
+                                            quantized);
     }
   }
   if (allow_KXJ) {
     if (row0[bx + cx].Strategy() != acs_rawKXJ) {
-      JXL_RETURN_IF_ERROR(entropy_KXJ_top =
+      entropy_KXJ_top =
           entropy_mul_JXK *
           EstimateEntropy(acsKXJ, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-                          cmap_factors, block, scratch_space, quantized));
+                          cmap_factors, block, scratch_space, quantized);
     }
     if (row1[bx + cx].Strategy() != acs_rawKXJ) {
-      JXL_RETURN_IF_ERROR(entropy_KXJ_bottom =
+      entropy_KXJ_bottom =
           entropy_mul_JXK * EstimateEntropy(acsKXJ, (bx + cx + 0) * 8,
                                             (by + cy + blocks_half) * 8, config,
                                             cmap_factors, block, scratch_space,
-                                            quantized));
+                                            quantized);
     }
   }
   if (allow_square_transform) {
     // We control the exploration of the square transform separately so that
     // we can turn it off at high decoding speeds for 32x32, but still allow
     // exploring 16x32 and 32x16.
-    JXL_RETURN_IF_ERROR(EstimateEntropy(entropy_JXJ = 
-                                        entropy_mul_JXJ * EstimateEntropy(acsJXJ, (bx + cx + 0) * 8,
+    entropy_JXJ = entropy_mul_JXJ * EstimateEntropy(acsJXJ, (bx + cx + 0) * 8,
                                         (by + cy + 0) * 8, config,
                                         cmap_factors, block,
-                                        scratch_space, quantized)));
+                                        scratch_space, quantized);
   }
 
   // Test if this block should have JXK or KXJ transforms,
@@ -1123,7 +1119,6 @@ HWY_EXPORT(ProcessRectACS);
 
 Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
                                   const ImageF& quant_field, const ImageF& mask,
-                                  const ImageF& mask1x1,
                                   DequantMatrices* matrices) {
   config.dequant = matrices;
 
@@ -1143,11 +1138,8 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   // Image row pointers and strides.
   config.quant_field_row = quant_field.Row(0);
   config.quant_field_stride = quant_field.PixelsPerRow();
-  config.mask1x1_xsize = mask1x1.xsize();
-  if (mask1x1.xsize() > 0 && mask1x1.ysize() > 0) {
-    config.masking1x1_field_row = mask1x1.Row(0);
-    config.masking1x1_field_stride = mask1x1.PixelsPerRow();
-  }
+  config.masking_field_row = mask.Row(0);
+  config.masking_field_stride = mask.PixelsPerRow();
 
   config.src_rows[0] = rect_in.ConstPlaneRow(src, 0, 0);
   config.src_rows[1] = rect_in.ConstPlaneRow(src, 1, 0);

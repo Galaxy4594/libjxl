@@ -855,8 +855,7 @@ StatusOr<Image3F> ReconstructImage(
 }
 
   
-float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
-                             const ImageF& mask1x1, size_t by, size_t bx) {
+float ComputeBlockL2Distance(const Image3F& a, const Image3F& b, size_t by, size_t bx) {
   Rect rect(bx * kBlockDim, by * kBlockDim, kBlockDim, kBlockDim, a.xsize(),
             a.ysize());
   float err2[3] = {0.0f};
@@ -871,13 +870,10 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
         rect.ConstPlaneRow(b, 1, y),
         rect.ConstPlaneRow(b, 2, y),
     };
-    const float* row_mask = rect.ConstRow(mask1x1, y);
     for (size_t x = 0; x < rect.xsize(); ++x) {
-      float mask = row_mask[x];
-      float mask2 = mask * mask;
       for (int i = 0; i < 3; ++i) {
 	float diff = row_a[i][x] - row_b[i][x];
-	err2[i] += mask2 * diff * diff;
+	err2[i] += diff * diff;
       }
     }
   }
@@ -937,7 +933,7 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       float* error_row = error_images[val].Row(by);
       for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
         error_row[bx] = ComputeBlockL2Distance(
-	    orig_opsin, decoded, initial_quant_masking, by, bx);
+	    orig_opsin, decoded, by, bx);
       }
     }
   }
@@ -1033,7 +1029,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   ImageFeatures& image_features = shared.image_features;
   DequantMatrices& matrices = shared.matrices;
   Quantizer& quantizer = shared.quantizer;
-  ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
+
   ImageI& raw_quant_field = shared.raw_quant_field;
   ColorCorrelationMap& cmap = shared.cmap;
   AcStrategyImage& ac_strategy = shared.ac_strategy;
@@ -1106,10 +1102,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     float masking = 1.0f / (q + 0.001f);
     FillImage(masking, &initial_quant_masking);
     if (cparams.disable_perceptual_optimizations) {
-      JXL_ASSIGN_OR_RETURN(
-          initial_quant_masking1x1,
-          ImageF::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
-      FillImage(masking, &initial_quant_masking1x1);
     }
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   } else {
@@ -1147,8 +1139,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(*opsin, rect, initial_quant_field,
-                                          initial_quant_masking,
-                                          initial_quant_masking1x1, &matrices));
+                                          initial_quant_masking, &matrices));
 
   auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
     size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);

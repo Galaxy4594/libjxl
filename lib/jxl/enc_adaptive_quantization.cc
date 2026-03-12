@@ -436,10 +436,6 @@ Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect, //FLA
       StoreMin4(rowb[xm1], min[0], min[1], min[2], min[3]);
       StoreMin4(rowb[x], min[0], min[1], min[2], min[3]);
       StoreMin4(rowb[xp1], min[0], min[1], min[2], min[3]);
-      static const float kMul0 = 0.125f;
-      static const float kMul1 = 0.075f;
-      static const float kMul2 = 0.06f;
-      static const float kMul3 = 0.05f;
 
       float v = kMul[0] * min[0] + kMul[1] * min[1] + kMul[2] * min[2] + kMul[3] * min[3];
       if (fx % 2 == 0 && fy % 2 == 0) {
@@ -468,7 +464,7 @@ struct AdaptiveQuantizationImpl {
   }
 
   Status ComputeTile(float butteraugli_target, float scale, const Image3F& xyb,
-                     const Rect& rect, const int thread, ImageF* mask) {
+                     const Rect& rect_in, const Rect& rect_out, const int thread, ImageF* mask) {
     JXL_ENSURE(rect_in.x0() % kBlockDim == 0);
     JXL_ENSURE(rect_in.y0() % kBlockDim == 0);
     const size_t xsize = xyb.xsize();
@@ -483,20 +479,7 @@ struct AdaptiveQuantizationImpl {
 
     const HWY_FULL(float) df;
 
-    size_t y_start_1x1 = rect_in.y0() + rect_out.y0() * 8;
-    size_t y_end_1x1 = y_start_1x1 + rect_out.ysize() * 8;
 
-    size_t x_start_1x1 = rect_in.x0() + rect_out.x0() * 8;
-    size_t x_end_1x1 = x_start_1x1 + rect_out.xsize() * 8;
-
-    if (rect_in.x0() != 0 && rect_out.x0() == 0) x_start_1x1 -= 2;
-    if (rect_in.x1() < xsize && rect_out.x1() * 8 == rect_in.xsize()) {
-      x_end_1x1 += 2;
-    }
-    if (rect_in.y0() != 0 && rect_out.y0() == 0) y_start_1x1 -= 2;
-    if (rect_in.y1() < ysize && rect_out.y1() * 8 == rect_in.ysize()) {
-      y_end_1x1 += 2;
-    }
     static const float limit = 0.2f;
     // Computes image (padded to multiple of 8x8) of local pixel differences.
     // Subsample both directions by 4.
@@ -514,7 +497,6 @@ struct AdaptiveQuantizationImpl {
     JXL_RETURN_IF_ERROR(pre_erosion[thread].ShrinkTo((x_end - x_start) / 4,
                                                      (y_end - y_start) / 4));
 
-    static const float limit = 0.2f;
     for (size_t y = y_start; y < y_end; ++y) {
       size_t y2 = y + 1 < ysize ? y + 1 : y;
       size_t y1 = y > 0 ? y - 1 : y;
@@ -589,7 +571,7 @@ struct AdaptiveQuantizationImpl {
     JXL_ENSURE(y_start % (kBlockDim / 2) == 0);
     Rect from_rect(x_start % 8 == 0 ? 0 : 1, y_start % 8 == 0 ? 0 : 1,
                    rect_out.xsize() * 2, rect_out.ysize() * 2);
-    JXL_RETURN_IF_ERROR(FuzzyErosion(bfrom_rect, pre_erosion[thread], rect, &aq_map));
+    JXL_RETURN_IF_ERROR(FuzzyErosion(butteraugli_target, from_rect, pre_erosion[thread], rect_out, &aq_map));
     for (size_t y = 0; y < rect_out.ysize(); ++y) {
       const float* aq_map_row = rect_out.ConstRow(aq_map, y);
       float* mask_row = rect_out.Row(mask, y);
@@ -1206,10 +1188,10 @@ float InitialQuantDC(float butteraugli_target) {
 StatusOr<ImageF> InitialQuantField(const float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
-                                   ImageF* mask, ImageF* mask1x1) {
+                                   ImageF* mask) {
   const float quant_ac = kAcQuant / butteraugli_target;
   return HWY_DYNAMIC_DISPATCH(AdaptiveQuantizationMap)(
-      butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask, mask1x1);
+      butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask);
 }
 
 Status FindBestQuantizer(const FrameHeader& frame_header, const Image3F* linear,
