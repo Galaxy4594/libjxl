@@ -93,12 +93,12 @@ float ComputeMaskForAcStrategyUse(const float out_val) {
 
 template <class D, class V>
 V ComputeMask(const D d, const V out_val) {
-  const auto kBase = Set(d, -0.7647f);
-  const auto kMul4 = Set(d, 9.4708735624378946f);
-  const auto kMul2 = Set(d, 17.35036561631863f);
-  const auto kOffset2 = Set(d, 302.59587815579727f);
-  const auto kMul3 = Set(d, 6.7943250517376494f);
-  const auto kOffset3 = Set(d, 3.7179635626140772f);
+  const auto kBase = Set(d, -0.76471879237038032f);
+  const auto kMul4 = Set(d, 4.4585596705216615f);
+  const auto kMul2 = Set(d, 17.282053892620215f);
+  const auto kOffset2 = Set(d, 302.36961315317848f);
+  const auto kMul3 = Set(d, 7.0561261998705858f);
+  const auto kOffset3 = Set(d, 2.3179635626140773f);
   const auto kOffset4 = Mul(Set(d, 0.25f), kOffset3);
   const auto kMul0 = Set(d, 0.80061762862741759f);
   const auto k1 = Set(d, 1.0f);
@@ -206,8 +206,8 @@ V GammaModulation(const D d, const size_t x, const size_t y,
   overall_ratio = Mul(SumOfLanes(d, overall_ratio), Set(d, 0.5f / 64));
   // ideally -1.0, but likely optimal correction adds some entropy, so slightly
   // less than that.
-  const auto kGamma = Set(d, 0.1005613337192697f);
-  return MulAdd(kGamma, FastLog2f(d, overall_ratio), out_val);
+  const auto kGam = Set(d, -0.15526878023684174f * 0.693147180559945f);
+  return MulAdd(kGam, FastLog2f(d, overall_ratio), out_val);
 }
 
 // Change precision in 8x8 blocks that have significant amounts of blue
@@ -217,7 +217,7 @@ V GammaModulation(const D d, const size_t x, const size_t y,
 // both M and L levels are low. In that case M and L receptors may be
 // observing S-spectra instead and viewing them with higher spatial
 // accuracy, justifying spending more bits here.
-template <class D, class V>
+template <class D, class V>  //FLAG: didn't add colormodulation yet
 V BlueModulation(const D d, const size_t x, const size_t y,
                  const ImageF& planex, const ImageF& planey,
                  const ImageF& planeb, const Rect& rect, const V out_val) {
@@ -267,7 +267,7 @@ V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
   // Sums of deltas of y and x components between (approximate)
   // 4-connected pixels.
   auto sum_y = Zero(d);
-  static const float valmin_y = 0.0206;
+  static const float valmin_y = 0.52489909479039587f;
   auto valminv_y = Set(d, valmin_y);
   for (size_t dy = 0; dy < 8; ++dy) {
     const float* JXL_RESTRICT row_in_y = rect.ConstRow(xyb_y, y + dy) + x;
@@ -306,7 +306,7 @@ V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
   scalar_sum_y *= kMul_y;
 
   // higher value -> more bpp
-  float kOffset = 0.42;
+  float kOffset = 0.42; //FLAG: idk how bbp cost works, didn't foward port
   scalar_sum_y += kOffset;
 
   return Add(Set(d, scalar_sum_y), out_val);
@@ -386,7 +386,7 @@ inline void StoreMin4(const float v, float& min0, float& min1, float& min2,
 // Look for smooth areas near the area of degradation.
 // If the areas are generally smooth, don't do masking.
 // Output is downsampled 2x.
-Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect,
+Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect, //FLAG: didn't backport
                     const ImageF& from, const Rect& to_rect, ImageF* to) {
   const size_t xsize = from.xsize();
   const size_t ysize = from.ysize();
@@ -436,6 +436,10 @@ Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect,
       StoreMin4(rowb[xm1], min[0], min[1], min[2], min[3]);
       StoreMin4(rowb[x], min[0], min[1], min[2], min[3]);
       StoreMin4(rowb[xp1], min[0], min[1], min[2], min[3]);
+      static const float kMul0 = 0.125f;
+      static const float kMul1 = 0.075f;
+      static const float kMul2 = 0.06f;
+      static const float kMul3 = 0.05f;
 
       float v = kMul[0] * min[0] + kMul[1] * min[1] + kMul[2] * min[2] + kMul[3] * min[3];
       if (fx % 2 == 0 && fy % 2 == 0) {
@@ -464,8 +468,7 @@ struct AdaptiveQuantizationImpl {
   }
 
   Status ComputeTile(float butteraugli_target, float scale, const Image3F& xyb,
-                     const Rect& rect_in, const Rect& rect_out,
-                     const int thread, ImageF* mask, ImageF* mask1x1) {
+                     const Rect& rect, const int thread, ImageF* mask) {
     JXL_ENSURE(rect_in.x0() % kBlockDim == 0);
     JXL_ENSURE(rect_in.y0() % kBlockDim == 0);
     const size_t xsize = xyb.xsize();
@@ -494,36 +497,9 @@ struct AdaptiveQuantizationImpl {
     if (rect_in.y1() < ysize && rect_out.y1() * 8 == rect_in.ysize()) {
       y_end_1x1 += 2;
     }
-
+    static const float limit = 0.2f;
     // Computes image (padded to multiple of 8x8) of local pixel differences.
     // Subsample both directions by 4.
-    // 1x1 Laplacian of intensity.
-    for (size_t y = y_start_1x1; y < y_end_1x1; ++y) {
-      const size_t y2 = y + 1 < ysize ? y + 1 : y;
-      const size_t y1 = y > 0 ? y - 1 : y;
-      const float* row_in = xyb.ConstPlaneRow(1, y);
-      const float* row_in1 = xyb.ConstPlaneRow(1, y1);
-      const float* row_in2 = xyb.ConstPlaneRow(1, y2);
-      float* mask1x1_out = mask1x1->Row(y);
-      auto scalar_pixel1x1 = [&](size_t x) {
-        const size_t x2 = x + 1 < xsize ? x + 1 : x;
-        const size_t x1 = x > 0 ? x - 1 : x;
-        const float base =
-            0.25f * (row_in2[x] + row_in1[x] + row_in[x1] + row_in[x2]);
-        const float gammac = RatioOfDerivativesOfCubicRootToSimpleGamma(
-            row_in[x] + match_gamma_offset);
-        float diff = std::abs(gammac * (row_in[x] - base));
-        static const double kScaler = 1.0;
-        diff *= kScaler;
-        diff = std::log1p(diff);
-        static const float kMul = 1.0;
-        static const float kOffset = 0.01;
-        mask1x1_out[x] = kMul / (diff + kOffset);
-      };
-      for (size_t x = x_start_1x1; x < x_end_1x1; ++x) {
-        scalar_pixel1x1(x);
-      }
-    }
 
     size_t y_start = rect_in.y0() + rect_out.y0() * 8;
     size_t y_end = y_start + rect_out.ysize() * 8;
@@ -613,8 +589,7 @@ struct AdaptiveQuantizationImpl {
     JXL_ENSURE(y_start % (kBlockDim / 2) == 0);
     Rect from_rect(x_start % 8 == 0 ? 0 : 1, y_start % 8 == 0 ? 0 : 1,
                    rect_out.xsize() * 2, rect_out.ysize() * 2);
-    JXL_RETURN_IF_ERROR(FuzzyErosion(butteraugli_target, from_rect,
-                                     pre_erosion[thread], rect_out, &aq_map));
+    JXL_RETURN_IF_ERROR(FuzzyErosion(bfrom_rect, pre_erosion[thread], rect, &aq_map));
     for (size_t y = 0; y < rect_out.ysize(); ++y) {
       const float* aq_map_row = rect_out.ConstRow(aq_map, y);
       float* mask_row = rect_out.Row(mask, y);
@@ -631,40 +606,10 @@ struct AdaptiveQuantizationImpl {
   ImageF diff_buffer;
 };
 
-Status Blur1x1Masking(JxlMemoryManager* memory_manager, ThreadPool* pool,
-                      ImageF* mask1x1, const Rect& rect) {
-  // Blur the mask1x1 to obtain the masking image.
-  // Before blurring it contains an image of absolute value of the
-  // Laplacian of the intensity channel.
-  static const float kFilterMask1x1[5] = {
-    0.364911248, 0.05, 0.1688888021, 0.221069183, 0.306563504,
-  };
-  double sum =
-      1.0 + 4 * (kFilterMask1x1[0] + kFilterMask1x1[1] + kFilterMask1x1[2] +
-                 kFilterMask1x1[4] + 2 * kFilterMask1x1[3]);
-  if (sum < 1e-5) {
-    sum = 1e-5;
-  }
-  const float normalize = static_cast<float>(1.0 / sum);
-  WeightsSymmetric5 weights =
-      WeightsSymmetric5{{HWY_REP4(normalize)},
-                        {HWY_REP4(normalize * kFilterMask1x1[0])},
-                        {HWY_REP4(normalize * kFilterMask1x1[2])},
-                        {HWY_REP4(normalize * kFilterMask1x1[1])},
-                        {HWY_REP4(normalize * kFilterMask1x1[4])},
-                        {HWY_REP4(normalize * kFilterMask1x1[3])}};
-  JXL_ASSIGN_OR_RETURN(
-      ImageF temp, ImageF::Create(memory_manager, rect.xsize(), rect.ysize()));
-  JXL_RETURN_IF_ERROR(
-      Symmetric5(*mask1x1, rect, weights, pool, &temp, Rect(temp)));
-  *mask1x1 = std::move(temp);
-  return true;
-}
-
 StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
                                          const Image3F& xyb, const Rect& rect,
                                          float scale, ThreadPool* pool,
-                                         ImageF* mask, ImageF* mask1x1) {
+                                         ImageF* mask) {
   JXL_ENSURE(rect.xsize() % kBlockDim == 0);
   JXL_ENSURE(rect.ysize() % kBlockDim == 0);
   AdaptiveQuantizationImpl impl;
@@ -675,8 +620,6 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
       impl.aq_map, ImageF::Create(memory_manager, xsize_blocks, ysize_blocks));
   JXL_ASSIGN_OR_RETURN(
       *mask, ImageF::Create(memory_manager, xsize_blocks, ysize_blocks));
-  JXL_ASSIGN_OR_RETURN(
-      *mask1x1, ImageF::Create(memory_manager, xyb.xsize(), xyb.ysize()));
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(impl.PrepareBuffers(memory_manager, num_threads));
     return true;
@@ -692,7 +635,7 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
     size_t bx1 = std::min((tx + 1) * kEncTileDimInBlocks, xsize_blocks);
     Rect rect_out(bx0, by0, bx1 - bx0, by1 - by0);
     JXL_RETURN_IF_ERROR(impl.ComputeTile(butteraugli_target, scale, xyb, rect,
-                                         rect_out, thread, mask, mask1x1));
+                                         rect_out, thread, mask));
     return true;
   };
   size_t num_tiles = DivCeil(xsize_blocks, kEncTileDimInBlocks) *
@@ -700,7 +643,6 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare, process_tile,
                                 "AQ DiffPrecompute"));
 
-  JXL_RETURN_IF_ERROR(Blur1x1Masking(memory_manager, pool, mask1x1, rect));
   return std::move(impl).aq_map;
 }
 
@@ -834,7 +776,7 @@ StatusOr<ImageF> TileDistMap(const ImageF& distmap, int tile_size, int margin,
 
 const float kDcQuantPow = 0.83f;
 const float kDcQuant = 1.095924047623553f;
-const float kAcQuant = 0.765f;
+const float kAcQuant = 0.7635f;
 
 // Computes the decoded image for a given set of compression parameters.
 StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,

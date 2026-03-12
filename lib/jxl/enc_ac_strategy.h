@@ -33,16 +33,15 @@ class AcStrategyImage;
 
 struct ACSConfig {
   const DequantMatrices* JXL_RESTRICT dequant;
+  float info_loss_multiplier;
+  float info_loss_multiplier2;
   const float* JXL_RESTRICT quant_field_row;
   size_t quant_field_stride;
   const float* JXL_RESTRICT masking_field_row;
   size_t masking_field_stride;
-  const float* JXL_RESTRICT masking1x1_field_row;
-  size_t masking1x1_field_stride;
   size_t mask1x1_xsize;
   const float* JXL_RESTRICT src_rows[3];
   size_t src_stride;
-  float info_loss_multiplier;
   float cost_delta;
   float zeros_mul;
   const float& Pixel(size_t c, size_t x, size_t y) const {
@@ -51,10 +50,6 @@ struct ACSConfig {
   float Masking(size_t bx, size_t by) const {
     JXL_DASSERT(masking_field_row[by * masking_field_stride + bx] > 0);
     return masking_field_row[by * masking_field_stride + bx];
-  }
-  const float* MaskingPtr1x1(size_t bx, size_t by) const {
-    JXL_DASSERT(masking1x1_field_row[by * masking1x1_field_stride + bx] > 0);
-    return &masking1x1_field_row[by * masking1x1_field_stride + bx];
   }
   float Quant(size_t bx, size_t by) const {
     JXL_DASSERT(quant_field_row[by * quant_field_stride + bx] > 0);

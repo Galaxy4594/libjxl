@@ -897,7 +897,6 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   const CompressParams& cparams = enc_state->cparams;
   PassesSharedState& shared = enc_state->shared;
   const FrameDimensions& frame_dim = shared.frame_dim;
-  const ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
   ImageB& epf_sharpness = shared.epf_sharpness;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
@@ -938,7 +937,7 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       float* error_row = error_images[val].Row(by);
       for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
         error_row[bx] = ComputeBlockL2Distance(
-	    orig_opsin, decoded, initial_quant_masking1x1, by, bx);
+	    orig_opsin, decoded, initial_quant_masking, by, bx);
       }
     }
   }
@@ -1122,8 +1121,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
-                          1.0f, &initial_quant_masking,
-                          &initial_quant_masking1x1));
+                          1.0f, &initial_quant_masking));
     float q = 0.39 / cparams.butteraugli_distance;
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   }
