@@ -210,69 +210,88 @@ V GammaModulation(const D d, const size_t x, const size_t y,
   return MulAdd(kGam, FastLog2f(d, overall_ratio), out_val);
 }
 
-// Change precision in 8x8 blocks that have significant amounts of blue
-// content (but are not close to solid blue).
-// This is based on the idea that M and L cone activations saturate the
-// S (blue) receptors, and the S reception becomes more important when
-// both M and L levels are low. In that case M and L receptors may be
-// observing S-spectra instead and viewing them with higher spatial
-// accuracy, justifying spending more bits here.
-template <class D, class V>  //FLAG: didn't add colormodulation yet
-V BlueModulation(const D d, const size_t x, const size_t y,
-                 const ImageF& planex, const ImageF& planey,
-                 const ImageF& planeb, const Rect& rect, const V out_val) {
-  auto sum = Zero(d);
-  static const float kLimit = 0.010474084867598155;
-  static const float kOffset = 0.0031994768654636393;
+template <class D, class V>
+V ColorModulation(const D d, const size_t x, const size_t y,
+                  const ImageF& xyb_x, const ImageF& xyb_y, const ImageF& xyb_b,
+                  const Rect& rect, const double butteraugli_target, V out_val) {
+  static const float kStrengthMul = 3.0;
+  static const float kRedRampStart = 0.045;
+  static const float kRedRampLength = 0.09;
+  static const float kBlueRampLength = 0.086890611400405895;
+  static const float kBlueRampStart = 0.26973418507870539;
+  const float strength = kStrengthMul * (1.0f - 0.25f * butteraugli_target);
+  if (strength < 0) {
+    return out_val;
+  }
+  // x values are smaller than y and b values, need to take the difference into
+  // account.
+  const float red_strength = strength * 6.5;
+  const float blue_strength = strength;
+  {
+    // Reduce some bits from areas not blue or red.
+    const float offset = strength * -0.007;  // 9174542291185913f;
+    out_val = Add(out_val, Set(d, offset));
+  }
+  // Calculate how much of the 8x8 block is covered with blue or red.
+  auto blue_coverage = Zero(d);
+  auto red_coverage = Zero(d);
+  auto bias_y = Set(d, 0.15f);
   for (size_t dy = 0; dy < 8; ++dy) {
-    const float* JXL_RESTRICT row_in_x = rect.ConstRow(planex, y + dy) + x;
-    const float* JXL_RESTRICT row_in_y = rect.ConstRow(planey, y + dy) + x;
-    const float* JXL_RESTRICT row_in_b = rect.ConstRow(planeb, y + dy) + x;
+    const float* const JXL_RESTRICT row_in_x = rect.ConstRow(xyb_x, y + dy);
+    const float* const JXL_RESTRICT row_in_y = rect.ConstRow(xyb_y, y + dy);
+    const float* const JXL_RESTRICT row_in_b = rect.ConstRow(xyb_b, y + dy);
     for (size_t dx = 0; dx < 8; dx += Lanes(d)) {
-      const auto p_x = Load(d, row_in_x + dx);
-      const auto p_b = Load(d, row_in_b + dx);
-      const auto p_y_raw = Add(Load(d, row_in_y + dx), Set(d, kOffset));
-      const auto p_y_effective = Add(p_y_raw, Abs(p_x));
-      sum = Add(sum,
-                IfThenElseZero(Gt(p_b, p_y_effective),
-                               Min(Sub(p_b, p_y_effective), Set(d, kLimit))));
+      const auto pixel_y = Load(d, row_in_y + x + dx);
+      // Estimate redness-greeness relative to the intensity.
+      const auto pixel_xpy =
+          Div(Abs(Load(d, row_in_x + x + dx)), Max(pixel_y, bias_y));
+      const auto pixel_x =
+          Max(Set(d, 0.0f), Sub(pixel_xpy, Set(d, kRedRampStart)));
+      const auto pixel_b =
+          Max(Set(d, 0.0f), Sub(Load(d, row_in_b + x + dx),
+                                Add(pixel_y, Set(d, kBlueRampStart))));
+      const auto blue_slope = Min(pixel_b, Set(d, kBlueRampLength));
+      const auto red_slope = Min(pixel_x, Set(d, kRedRampLength));
+      red_coverage = Add(red_coverage, red_slope);
+      blue_coverage = Add(blue_coverage, blue_slope);
     }
   }
-  static const float kMul = 0.90590804735610064;
-  sum = SumOfLanes(d, sum);
-  float scalar_sum = GetLane(sum);
-  // If it is all blue, don't boost the quantization.
-  // All blue likely means low frequency blue. Let's not make the most
-  // perfect sky ever.
-  if (scalar_sum >= 32 * kLimit) {
-    scalar_sum = 64 * kLimit - scalar_sum;
-  }
-  static const float kMaxLimit = 15.463398341612438;
-  if (scalar_sum >= kMaxLimit * kLimit) {
-    scalar_sum = kMaxLimit * kLimit;
-  }
-  scalar_sum *= kMul;
-  return Add(Set(d, scalar_sum), out_val);
+
+  // Saturate when the high red or high blue coverage is above a level.
+  // The idea here is that if a certain fraction of the block is red or
+  // blue we consider as if it was fully red or blue.
+  static const float ratio = 28.0f;  // out of 64 pixels.
+
+  auto overall_red_coverage = SumOfLanes(d, red_coverage);
+  overall_red_coverage =
+      Min(overall_red_coverage, Set(d, ratio * kRedRampLength));
+  overall_red_coverage =
+      Mul(overall_red_coverage, Set(d, red_strength / ratio));
+
+  auto overall_blue_coverage = SumOfLanes(d, blue_coverage);
+  overall_blue_coverage =
+      Min(overall_blue_coverage, Set(d, ratio * kBlueRampLength));
+  overall_blue_coverage =
+      Mul(overall_blue_coverage, Set(d, blue_strength / ratio));
+
+  return Add(overall_red_coverage, Add(overall_blue_coverage, out_val));
 }
 
 // Change precision in 8x8 blocks that have high frequency content.
 template <class D, class V>
-V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
+V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb,
                const Rect& rect, const V out_val) {
   // Zero out the invalid differences for the rightmost value per row.
   const Rebind<uint32_t, D> du;
   HWY_ALIGN constexpr uint32_t kMaskRight[kBlockDim] = {~0u, ~0u, ~0u, ~0u,
                                                         ~0u, ~0u, ~0u, 0};
 
-  // Sums of deltas of y and x components between (approximate)
-  // 4-connected pixels.
-  auto sum_y = Zero(d);
-  static const float valmin_y = 0.52489909479039587f;
-  auto valminv_y = Set(d, valmin_y);
+  auto sum = Zero(d);  // sum of absolute differences with right and below
+
   for (size_t dy = 0; dy < 8; ++dy) {
-    const float* JXL_RESTRICT row_in_y = rect.ConstRow(xyb_y, y + dy) + x;
-    const float* JXL_RESTRICT row_in_y_next =
-        dy == 7 ? row_in_y : rect.ConstRow(xyb_y, y + dy + 1) + x;
+    const float* JXL_RESTRICT row_in = rect.ConstRow(xyb, y + dy) + x;
+    const float* JXL_RESTRICT row_in_next =
+        dy == 7 ? row_in : rect.ConstRow(xyb, y + dy + 1) + x;
 
     // In SCALAR, there is no guarantee of having extra row padding.
     // Hence, we need to ensure we don't access pixels outside the row itself.
@@ -284,32 +303,23 @@ V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
 #else
     for (size_t dx = 0; dx < 7; dx += Lanes(d)) {
 #endif
+      const auto p = Load(d, row_in + dx);
+      const auto pr = LoadU(d, row_in + dx + 1);
       const auto mask = BitCast(d, Load(du, kMaskRight + dx));
-      {
-        const auto p_y = Load(d, row_in_y + dx);
-        const auto pr_y = LoadU(d, row_in_y + dx + 1);
-        sum_y = Add(sum_y, And(mask, Min(valminv_y, AbsDiff(p_y, pr_y))));
-        const auto pd_y = Load(d, row_in_y_next + dx);
-        sum_y = Add(sum_y, Min(valminv_y, AbsDiff(p_y, pd_y)));
-      }
+      sum = Add(sum, And(mask, AbsDiff(p, pr)));
+
+      const auto pd = Load(d, row_in_next + dx);
+      sum = Add(sum, AbsDiff(p, pd));
     }
 #if HWY_TARGET == HWY_SCALAR
-    const auto p_y = Load(d, row_in_y + 7);
-    const auto pd_y = Load(d, row_in_y_next + 7);
-    sum_y = Add(sum_y, Min(valminv_y, AbsDiff(p_y, pd_y)));
+    const auto p = Load(d, row_in + 7);
+    const auto pd = Load(d, row_in_next + 7);
+    sum = Add(sum, AbsDiff(p, pd));
 #endif
   }
-  static const float kMul_y = -0.38;
-  sum_y = SumOfLanes(d, sum_y);
 
-  float scalar_sum_y = GetLane(sum_y);
-  scalar_sum_y *= kMul_y;
-
-  // higher value -> more bpp
-  float kOffset = 0.42; //FLAG: idk how bbp cost works, didn't foward port
-  scalar_sum_y += kOffset;
-
-  return Add(Set(d, scalar_sum_y), out_val);
+  sum = SumOfLanes(d, sum);
+  return MulAdd(sum, Set(d, -2.0052193233688884f / 112), out_val);
 }
 
 void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
@@ -336,10 +346,10 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
     for (size_t ix = rect_out.x0(); ix < rect_out.x1(); ix++) {
       size_t x = ix * 8;
       auto mask_val = ComputeMask(df, Set(df, row_out[ix]));
-      mask_val = GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, mask_val);
       auto out_val = HfModulation(df, x, y, xyb_y, rect_in, mask_val);
-      out_val = Min(out_val, BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b,
-                                            rect_in, mask_val));
+      out_val = ColorModulation(df, x, y, xyb_x, xyb_y, xyb_b, rect_in,
+                                butteraugli_target, out_val);
+      out_val = GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, out_val);
       // We want multiplicative quantization field, so everything
       // until this point has been modulating the exponent.
       row_out[ix] = FastPow2f(GetLane(out_val) * 1.442695041f) * mul + add;
@@ -386,7 +396,7 @@ inline void StoreMin4(const float v, float& min0, float& min1, float& min2,
 // Look for smooth areas near the area of degradation.
 // If the areas are generally smooth, don't do masking.
 // Output is downsampled 2x.
-Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect, //FLAG: didn't backport
+Status FuzzyErosion(const Rect& from_rect,
                     const ImageF& from, const Rect& to_rect, ImageF* to) {
   const size_t xsize = from.xsize();
   const size_t ysize = from.ysize();
@@ -394,22 +404,6 @@ Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect, //FLA
   static_assert(kStep == 1, "Step must be 1");
   JXL_ENSURE(to_rect.xsize() * 2 == from_rect.xsize());
   JXL_ENSURE(to_rect.ysize() * 2 == from_rect.ysize());
-  static const float kMulBase[4] = { 0.125, 0.1, 0.09, 0.06 };
-  static const float kMulAdd[4] = { 0.0, -0.1, -0.09, -0.06 };
-  float mul = 0.0;
-  if (butteraugli_target < 2.0f) {
-    mul = (2.0f - butteraugli_target) * (1.0f / 2.0f);
-  }
-  float kMul[4] = { 0 };
-  float norm_sum = 0.0;
-  for (size_t ii = 0; ii < 4; ++ii) {
-    kMul[ii] = kMulBase[ii] + mul * kMulAdd[ii];
-    norm_sum += kMul[ii];
-  }
-  static const float kTotal = 0.29959705784054957;
-  for (size_t ii = 0; ii < 4; ++ii) {
-    kMul[ii] *= kTotal / norm_sum;
-  }
   for (size_t fy = 0; fy < from_rect.ysize(); ++fy) {
     size_t y = fy + from_rect.y0();
     size_t ym1 = y >= kStep ? y - kStep : y;
@@ -422,22 +416,28 @@ Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect, //FLA
       size_t x = fx + from_rect.x0();
       size_t xm1 = x >= kStep ? x - kStep : x;
       size_t xp1 = x + kStep < xsize ? x + kStep : x;
-      float min[4] = { row[x], row[xm1], row[xp1], rowt[xm1] };
+      float min0 = row[x];
+      float min1 = row[xm1];
+      float min2 = row[xp1];
+      float min3 = rowt[xm1];
       // Sort the first four values.
-      if (min[0] > min[1]) std::swap(min[0], min[1]);
-      if (min[0] > min[2]) std::swap(min[0], min[2]);
-      if (min[0] > min[3]) std::swap(min[0], min[3]);
-      if (min[1] > min[2]) std::swap(min[1], min[2]);
-      if (min[1] > min[3]) std::swap(min[1], min[3]);
-      if (min[2] > min[3]) std::swap(min[2], min[3]);
+      if (min0 > min1) std::swap(min0, min1);
+      if (min0 > min2) std::swap(min0, min2);
+      if (min0 > min3) std::swap(min0, min3);
+      if (min1 > min2) std::swap(min1, min2);
+      if (min1 > min3) std::swap(min1, min3);
+      if (min2 > min3) std::swap(min2, min3);
       // The remaining five values of a 3x3 neighbourhood.
-      StoreMin4(rowt[x], min[0], min[1], min[2], min[3]);
-      StoreMin4(rowt[xp1], min[0], min[1], min[2], min[3]);
-      StoreMin4(rowb[xm1], min[0], min[1], min[2], min[3]);
-      StoreMin4(rowb[x], min[0], min[1], min[2], min[3]);
-      StoreMin4(rowb[xp1], min[0], min[1], min[2], min[3]);
-
-      float v = kMul[0] * min[0] + kMul[1] * min[1] + kMul[2] * min[2] + kMul[3] * min[3];
+      StoreMin4(rowt[x], min0, min1, min2, min3);
+      StoreMin4(rowt[xp1], min0, min1, min2, min3);
+      StoreMin4(rowb[xm1], min0, min1, min2, min3);
+      StoreMin4(rowb[x], min0, min1, min2, min3);
+      StoreMin4(rowb[xp1], min0, min1, min2, min3);
+      static const float kMul0 = 0.125f;
+      static const float kMul1 = 0.075f;
+      static const float kMul2 = 0.06f;
+      static const float kMul3 = 0.05f;
+      float v = kMul0 * min0 + kMul1 * min1 + kMul2 * min2 + kMul3 * min3;
       if (fx % 2 == 0 && fy % 2 == 0) {
         row_out[fx / 2] = v;
       } else {
@@ -571,7 +571,7 @@ struct AdaptiveQuantizationImpl {
     JXL_ENSURE(y_start % (kBlockDim / 2) == 0);
     Rect from_rect(x_start % 8 == 0 ? 0 : 1, y_start % 8 == 0 ? 0 : 1,
                    rect_out.xsize() * 2, rect_out.ysize() * 2);
-    JXL_RETURN_IF_ERROR(FuzzyErosion(butteraugli_target, from_rect, pre_erosion[thread], rect_out, &aq_map));
+    JXL_RETURN_IF_ERROR(FuzzyErosion(from_rect, pre_erosion[thread], rect_out, &aq_map));
     for (size_t y = 0; y < rect_out.ysize(); ++y) {
       const float* aq_map_row = rect_out.ConstRow(aq_map, y);
       float* mask_row = rect_out.Row(mask, y);

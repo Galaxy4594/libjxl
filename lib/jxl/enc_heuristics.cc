@@ -1108,13 +1108,13 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     // Call this here, as it relies on pre-gaborish values.
     float butteraugli_distance_for_iqf = cparams.butteraugli_distance;
     if (!frame_header.loop_filter.gab) {
-      butteraugli_distance_for_iqf *= 0.62f;
+      butteraugli_distance_for_iqf *= 0.73f;
     }
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
                           1.0f, &initial_quant_masking));
-    float q = 0.39 / cparams.butteraugli_distance;
+    float q = 0.79 / cparams.butteraugli_distance;
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   }
 
