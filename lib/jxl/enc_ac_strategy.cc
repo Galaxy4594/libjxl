@@ -485,15 +485,15 @@ float EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
       const auto diff = AbsDiff(val, rval);
       info_loss = Add(info_loss, diff);
       info_loss2 = MulAdd(diff, diff, info_loss2);
-      const auto q = Abs(rval);
-      const auto q_is_zero = Eq(q, Zero(df));
-      entropy_v = Add(entropy_v, IfThenElseZero(Ge(q, Set(df, 1.5f)), cost2));
+      const auto abs_rval = Abs(rval);
+      const auto q_is_zero = Eq(abs_rval, Zero(df));
+      entropy_v = Add(entropy_v, IfThenElseZero(Ge(abs_rval, Set(df, 1.5f)), cost2));
       // We used to have q * C here, but that cost model seems to
       // be punishing large values more than necessary. Sqrt tries
       // to avoid large values less aggressively. Having high accuracy
       // around zero is most important at low qualities, and there
       // we have directly specified costs for 0, 1, and 2.
-      entropy_v = MulAdd(Sqrt(q), cost_delta, entropy_v);
+      entropy_v = MulAdd(Sqrt(abs_rval), cost_delta, entropy_v);
       nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, Set(df, 1.0f)));
     }
     entropy_v = MulAdd(nzeros_v, cost1, entropy_v);

@@ -967,8 +967,8 @@ struct JxlOutputProcessor {
     }
   }
 
-  void SetFinalizedPosition(uint64_t finalized_position) {
-    this->finalized_position = finalized_position;
+  void SetFinalizedPosition(uint64_t pos) {
+    this->finalized_position = pos;
   }
 
   std::vector<uint8_t> output;
