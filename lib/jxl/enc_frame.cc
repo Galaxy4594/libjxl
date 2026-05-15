@@ -32,8 +32,8 @@
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/cms/opsin_params.h"
 #include "lib/jxl/chroma_from_luma.h"
+#include "lib/jxl/cms/opsin_params.h"
 #include "lib/jxl/coeff_order.h"
 #include "lib/jxl/coeff_order_fwd.h"
 #include "lib/jxl/color_encoding_internal.h"
@@ -1609,34 +1609,15 @@ Status ComputeEncodingData(
       }
 
       const float* custom_opsin_ptr = nullptr;
-      float custom_opsin[9] = {
-        jxl::cms::kM00, jxl::cms::kM01, jxl::cms::kM02,
-        jxl::cms::kM10, jxl::cms::kM11, jxl::cms::kM12,
-        jxl::cms::kM20, jxl::cms::kM21, jxl::cms::kM22
-      };
-      if (cparams.red_bias >= 0.0f || cparams.green_bias >= 0.0f || cparams.isolate_s_cone || cparams.yellow_bias >= 0.0f) {
-        if (cparams.red_bias >= 0.0f) {
-          float r = cparams.red_bias;
-          float g_ratio = jxl::cms::kM01 / (jxl::cms::kM01 + jxl::cms::kM02);
-          custom_opsin[0] = r;
-          custom_opsin[1] = g_ratio * (1.0f - r);
-          custom_opsin[2] = (1.0f - g_ratio) * (1.0f - r);
-        }
-        if (cparams.green_bias >= 0.0f) {
-          float g = cparams.green_bias;
-          float r_ratio = jxl::cms::kM10 / (jxl::cms::kM10 + jxl::cms::kM12);
-          custom_opsin[4] = g;
-          custom_opsin[3] = r_ratio * (1.0f - g);
-          custom_opsin[5] = (1.0f - r_ratio) * (1.0f - g);
-        }
-        if (cparams.isolate_s_cone) {
-          custom_opsin[6] = 0.0f; custom_opsin[7] = 0.0f; custom_opsin[8] = 1.0f;
-        } else if (cparams.yellow_bias >= 0.0f) {
-          float b = cparams.yellow_bias;
-          float r_ratio = jxl::cms::kM20 / (jxl::cms::kM20 + jxl::cms::kM21);
-          custom_opsin[8] = b;
-          custom_opsin[6] = r_ratio * (1.0f - b);
-          custom_opsin[7] = (1.0f - r_ratio) * (1.0f - b);
+      float custom_opsin[9];
+      if (!metadata->transform_data.opsin_inverse_matrix.all_default) {
+        jxl::Matrix3x3 forward_matrix =
+            metadata->transform_data.opsin_inverse_matrix.inverse_matrix;
+        JXL_RETURN_IF_ERROR(jxl::Inv3x3Matrix(forward_matrix));
+        for (int i = 0; i < 3; i++) {
+          for (int j = 0; j < 3; j++) {
+            custom_opsin[i * 3 + j] = forward_matrix[i][j];
+          }
         }
         custom_opsin_ptr = custom_opsin;
       }

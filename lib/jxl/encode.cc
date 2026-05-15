@@ -31,14 +31,14 @@
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/exif.h"
+#include "lib/jxl/base/matrix_ops.h"
 #include "lib/jxl/base/override.h"
 #include "lib/jxl/base/printf_macros.h"
 #include "lib/jxl/base/sanitizers.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/base/matrix_ops.h"
-#include "lib/jxl/cms/opsin_params.h"
 #include "lib/jxl/cms/color_encoding_cms.h"
+#include "lib/jxl/cms/opsin_params.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/enc_aux_out.h"
 #include "lib/jxl/enc_bit_writer.h"
@@ -762,6 +762,46 @@ void FastLosslessRunnerAdapter(void* void_ticket, void* opaque,
   }
 }
 
+void ComputeCustomOpsinMatrix(const jxl::CompressParams& cparams,
+                              jxl::Matrix3x3& custom_opsin) {
+  custom_opsin = {{
+      {{jxl::cms::kM00, jxl::cms::kM01, jxl::cms::kM02}},
+      {{jxl::cms::kM10, jxl::cms::kM11, jxl::cms::kM12}},
+      {{jxl::cms::kM20, jxl::cms::kM21, jxl::cms::kM22}},
+  }};
+  if (cparams.red_bias >= 0.0f) {
+    float r = cparams.red_bias;
+    float g_ratio = jxl::cms::kM01 / (jxl::cms::kM01 + jxl::cms::kM02);
+    custom_opsin[0][0] = r;
+    custom_opsin[0][1] = g_ratio * (1.0f - r);
+    custom_opsin[0][2] = (1.0f - g_ratio) * (1.0f - r);
+  }
+  if (cparams.green_bias >= 0.0f) {
+    float g = cparams.green_bias;
+    float r_ratio = jxl::cms::kM10 / (jxl::cms::kM10 + jxl::cms::kM12);
+    custom_opsin[1][1] = g;
+    custom_opsin[1][0] = r_ratio * (1.0f - g);
+    custom_opsin[1][2] = (1.0f - r_ratio) * (1.0f - g);
+  }
+  if (cparams.yellow_bias >= 0.0f) {
+    float b = cparams.yellow_bias;
+    float r_ratio = jxl::cms::kM20 / (jxl::cms::kM20 + jxl::cms::kM21);
+    custom_opsin[2][2] = b;
+    custom_opsin[2][0] = r_ratio * (1.0f - b);
+    custom_opsin[2][1] = (1.0f - r_ratio) * (1.0f - b);
+  } else if (cparams.color_boost && cparams.butteraugli_distance > 0.3f) {
+    // Yellow dynamic scaling
+    float dist =
+        std::max(0.3f, std::min(3.0f, cparams.butteraugli_distance));
+    float factor = (dist - 0.3f) / 2.7f;
+    float b = jxl::cms::kM22 + factor * (0.85f - jxl::cms::kM22);
+    float r_ratio_b = jxl::cms::kM20 / (jxl::cms::kM20 + jxl::cms::kM21);
+    custom_opsin[2][2] = b;
+    custom_opsin[2][0] = r_ratio_b * (1.0f - b);
+    custom_opsin[2][1] = (1.0f - r_ratio_b) * (1.0f - b);
+  }
+}
+
 }  // namespace
 
 jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
@@ -820,43 +860,18 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
     }
 
     if (first_frame_settings) {
+      bool active_color_boost =
+          first_frame_settings->cparams.color_boost &&
+          first_frame_settings->cparams.butteraugli_distance > 0.3f;
       if (first_frame_settings->cparams.red_bias >= 0.0f ||
           first_frame_settings->cparams.green_bias >= 0.0f ||
-          first_frame_settings->cparams.isolate_s_cone ||
+          active_color_boost ||
           first_frame_settings->cparams.yellow_bias >= 0.0f) {
         metadata.transform_data.all_default = false;
         metadata.transform_data.opsin_inverse_matrix.all_default = false;
 
-        jxl::Matrix3x3 custom_opsin = {{
-            {{jxl::cms::kM00, jxl::cms::kM01, jxl::cms::kM02}},
-            {{jxl::cms::kM10, jxl::cms::kM11, jxl::cms::kM12}},
-            {{jxl::cms::kM20, jxl::cms::kM21, jxl::cms::kM22}},
-        }};
-        if (first_frame_settings->cparams.red_bias >= 0.0f) {
-          float r = first_frame_settings->cparams.red_bias;
-          float g_ratio = jxl::cms::kM01 / (jxl::cms::kM01 + jxl::cms::kM02);
-          custom_opsin[0][0] = r;
-          custom_opsin[0][1] = g_ratio * (1.0f - r);
-          custom_opsin[0][2] = (1.0f - g_ratio) * (1.0f - r);
-        }
-        if (first_frame_settings->cparams.green_bias >= 0.0f) {
-          float g = first_frame_settings->cparams.green_bias;
-          float r_ratio = jxl::cms::kM10 / (jxl::cms::kM10 + jxl::cms::kM12);
-          custom_opsin[1][1] = g;
-          custom_opsin[1][0] = r_ratio * (1.0f - g);
-          custom_opsin[1][2] = (1.0f - r_ratio) * (1.0f - g);
-        }
-        if (first_frame_settings->cparams.isolate_s_cone) {
-          custom_opsin[2][0] = 0.0f;
-          custom_opsin[2][1] = 0.0f;
-          custom_opsin[2][2] = 1.0f;
-        } else if (first_frame_settings->cparams.yellow_bias >= 0.0f) {
-          float b = first_frame_settings->cparams.yellow_bias;
-          float r_ratio = jxl::cms::kM20 / (jxl::cms::kM20 + jxl::cms::kM21);
-          custom_opsin[2][2] = b;
-          custom_opsin[2][0] = r_ratio * (1.0f - b);
-          custom_opsin[2][1] = (1.0f - r_ratio) * (1.0f - b);
-        }
+        jxl::Matrix3x3 custom_opsin;
+        ComputeCustomOpsinMatrix(first_frame_settings->cparams, custom_opsin);
 
         // matrix_ops.h Inv3x3Matrix modifies the matrix in place.
         JXL_RETURN_IF_ERROR(jxl::Inv3x3Matrix(custom_opsin));
@@ -1990,8 +2005,8 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       frame_settings->values.cparams.output_mode = value;
       break;
 
-    case JXL_ENC_FRAME_SETTING_ISOLATE_S_CONE:
-      frame_settings->values.cparams.isolate_s_cone = default_to_true(value);
+    case JXL_ENC_FRAME_SETTING_COLOR_BOOST:
+      frame_settings->values.cparams.color_boost = (value > 0.5f);
       return JxlErrorOrStatus::Success();
     default:
       return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_NOT_SUPPORTED,
