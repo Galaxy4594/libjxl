@@ -51,6 +51,17 @@ using hwy::HWY_NAMESPACE::IfThenElse;
 using hwy::HWY_NAMESPACE::Lt;
 
 static HWY_FULL(float) df;
+// Weighted profile to prioritize low-frequency AC coefficients in CfL search.
+static const float kWeightProfile[64] = {
+    0.0f, 3.00f, 3.00f, 2.85f, 2.85f, 2.85f, 2.70f, 2.70f,
+    2.70f, 2.70f, 2.50f, 2.50f, 2.50f, 2.50f, 2.50f, 2.30f,
+    2.30f, 2.30f, 2.30f, 2.30f, 2.30f, 2.10f, 2.10f, 2.10f,
+    2.10f, 2.10f, 2.10f, 2.10f, 1.90f, 1.90f, 1.90f, 1.90f,
+    1.90f, 1.90f, 1.90f, 1.90f, 1.70f, 1.70f, 1.70f, 1.70f,
+    1.70f, 1.70f, 1.70f, 1.50f, 1.50f, 1.50f, 1.50f, 1.50f,
+    1.50f, 1.30f, 1.30f, 1.30f, 1.30f, 1.30f, 1.15f, 1.15f,
+    1.15f, 1.15f, 1.05f, 1.05f, 1.05f, 1.00f, 1.00f, 1.00f
+};
 
 struct CFLFunction {
   static constexpr float kCoeff = 1.f / 3;
@@ -105,10 +116,11 @@ struct CFLFunction {
       dpe = IfThenElse(Lt(vpe, zero), Sub(zero, dpe), dpe);
       dme = IfThenElse(Lt(vme, zero), Sub(zero, dme), dme);
       const auto above = Ge(av, thres);
+      const auto w = LoadU(df, kWeightProfile + (i % 64));
       // TODO(eustas): use IfThenElseZero
-      fd_v = Add(fd_v, IfThenElse(above, zero, d));
-      fdpe_v = Add(fdpe_v, IfThenElse(above, zero, dpe));
-      fdme_v = Add(fdme_v, IfThenElse(above, zero, dme));
+      fd_v = Add(fd_v, Mul(w, IfThenElse(above, zero, d)));
+      fdpe_v = Add(fdpe_v, Mul(w, IfThenElse(above, zero, dpe)));
+      fdme_v = Add(fdme_v, Mul(w, IfThenElse(above, zero, dme)));
     }
 
     *fpeps = first_derivative_peps + GetLane(SumOfLanes(df, fdpe_v));
@@ -138,12 +150,13 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
     const auto inv_color_factor = Set(df, kInvColorFactor);
     const auto base_v = Set(df, base);
     for (size_t i = 0; i < num; i += Lanes(df)) {
+      const auto w = LoadU(df, kWeightProfile + (i % 64));
       // color residual = ax + b
       const auto a = Mul(inv_color_factor, Load(df, values_m + i));
       const auto b =
           Sub(Mul(base_v, Load(df, values_m + i)), Load(df, values_s + i));
-      ca = MulAdd(a, a, ca);
-      cb = MulAdd(a, b, cb);
+      ca = MulAdd(Mul(w, a), a, ca);
+      cb = MulAdd(Mul(w, a), b, cb);
     }
     // + distance_mul * x^2 * num
     x = -GetLane(SumOfLanes(df, cb)) /
@@ -370,12 +383,53 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   }
 
 
-  row_out_x[tx] = FindBestMultiplier(coeffs_yx, coeffs_x, num_ac, 0.0f,
-                                     kDistanceMultiplierAC, fast,
-                                     towards_zero_x);
-  row_out_b[tx] =
+  auto evaluate_candidate = [&](const float* m, const float* s, float multiplier,
+                                float base) {
+    float total_cost = 0;
+    for (size_t i = 0; i < num_ac; ++i) {
+      float res = s[i] - (base + multiplier / kDefaultColorFactor) * m[i];
+      float abs_res = std::abs(res);
+      float w = kWeightProfile[i % 64];
+      // Perceptual cost: penalize desaturation (residual opposite to original)
+      // more than oversaturation.
+      float cost = w * abs_res;
+      if (multiplier > 0 && res < 0) cost *= 1.2f;
+      if (multiplier < 0 && res > 0) cost *= 1.2f;
+      total_cost += cost;
+    }
+    // Add bit-cost penalty for the multiplier itself.
+    total_cost += std::abs(multiplier) * 0.1f;
+    return total_cost;
+  };
+
+  auto optimize_multiplier = [&](const float* m, const float* s, float initial,
+                                 float base) {
+    if (cparams.speed_tier > SpeedTier::kSquirrel || fast) {
+      return (int32_t)std::round(initial);
+    }
+    int32_t best_m = std::round(initial);
+    float best_cost = evaluate_candidate(m, s, best_m, base);
+    for (int delta : {-2, -1, 1, 2}) {
+      int32_t cand = jxl::Clamp1(best_m + delta, -128, 127);
+      float cost = evaluate_candidate(m, s, cand, base);
+      if (cost < best_cost) {
+        best_cost = cost;
+        best_m = cand;
+      }
+    }
+    return best_m;
+  };
+
+  float initial_x = FindBestMultiplier(coeffs_yx, coeffs_x, num_ac, 0.0f,
+                                       kDistanceMultiplierAC, fast,
+                                       towards_zero_x);
+  row_out_x[tx] = optimize_multiplier(coeffs_yx, coeffs_x, initial_x, 0.0f);
+
+  float initial_b =
       FindBestMultiplier(coeffs_yb, coeffs_b, num_ac, jxl::cms::kYToBRatio,
                          kDistanceMultiplierAC, fast, towards_zero_b);
+  row_out_b[tx] =
+      optimize_multiplier(coeffs_yb, coeffs_b, initial_b, jxl::cms::kYToBRatio);
   return true;
 }
 
