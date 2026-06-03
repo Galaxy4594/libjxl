@@ -1171,7 +1171,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
           r, *opsin, rect, matrices,
           /*ac_strategy=*/nullptr,
           /*raw_quant_field=*/nullptr,
-          /*quantizer=*/nullptr, /*fast=*/false, thread, &cmap));
+          /*quantizer=*/nullptr, cparams, /*fast=*/false, thread, &cmap));
     }
 
     // Choose block sizes.
@@ -1190,7 +1190,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     if (cparams.speed_tier <= SpeedTier::kHare) {
       JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
           r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field, &quantizer,
-          /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread, &cmap));
+          cparams, /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread,
+          &cmap));
     }
     return true;
   };

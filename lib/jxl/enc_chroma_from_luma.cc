@@ -126,7 +126,7 @@ struct CFLFunction {
 // Chroma-from-luma search, values_m will have luma -- and values_s chroma.
 int32_t FindBestMultiplier(const float* values_m, const float* values_s,
                            size_t num, float base, float distance_mul,
-                           bool fast) {
+                           bool fast, float towards_zero) {
   if (num == 0) {
     return 0;
   }
@@ -173,7 +173,6 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
   // look into variance of the multiplier within separate (e.g. 8x8)
   // areas and only apply this heuristic where there is a high variance.
   // This would give about 1 % more compression density.
-  float towards_zero = 2.6;
   if (x >= towards_zero) {
     x -= towards_zero;
   } else if (x <= -towards_zero) {
@@ -209,8 +208,9 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const DequantMatrices& dequant,
                    const AcStrategyImage* ac_strategy,
                    const ImageI* raw_quant_field, const Quantizer* quantizer,
-                   const Rect& rect, bool fast, bool use_dct8, ImageSB* map_x,
-                   ImageSB* map_b, ImageF* dc_values, Span<float> mem) {
+                   const CompressParams& cparams, const Rect& rect, bool fast,
+                   bool use_dct8, ImageSB* map_x, ImageSB* map_b,
+                   ImageF* dc_values, Span<float> mem) {
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
                 "Invalid color tile dim");
   size_t xsize_blocks = opsin_rect.xsize() / kBlockDim;
@@ -344,12 +344,38 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       }
     }
   }
-  JXL_ENSURE(num_ac % Lanes(df) == 0);
+  // Path 3: Adaptive CfL quantization.
+  // The standard fixed deadzone (2.6) often wipes out chroma correlation on
+  // saturated edges at low bitrates, leading to a "leap to white" artifact
+  // (the Helmholtz-Kohlrausch effect where desaturated pixels look too bright).
+  // By reducing this deadzone based on tile energy,
+  // we preserve the chroma signal while still avoiding noise in near-neutral
+  // areas. This improves perceptual metrics (SSIMULACRA2) and maintains
+  // color fidelity on vivid edges.
+  float towards_zero_x = 2.6f;
+  float towards_zero_b = 2.6f;
+
+  if (num_ac > 0) {
+    auto sum_abs = [](const float* f, size_t n) {
+      float s = 0.0f;
+      for (size_t i = 0; i < n; ++i) s += std::abs(f[i]);
+      return s / n;
+    };
+    float energy_x = sum_abs(coeffs_x, num_ac);
+    float energy_b = sum_abs(coeffs_b, num_ac);
+
+    // If there's significant AC energy in chroma, it's likely a saturated edge.
+    if (energy_x > 0.1f) towards_zero_x = 1.2f;
+    if (energy_b > 0.1f) towards_zero_b = 1.0f;
+  }
+
+
   row_out_x[tx] = FindBestMultiplier(coeffs_yx, coeffs_x, num_ac, 0.0f,
-                                     kDistanceMultiplierAC, fast);
+                                     kDistanceMultiplierAC, fast,
+                                     towards_zero_x);
   row_out_b[tx] =
       FindBestMultiplier(coeffs_yb, coeffs_b, num_ac, jxl::cms::kYToBRatio,
-                         kDistanceMultiplierAC, fast);
+                         kDistanceMultiplierAC, fast, towards_zero_b);
   return true;
 }
 
@@ -376,14 +402,16 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
                                   const DequantMatrices& dequant,
                                   const AcStrategyImage* ac_strategy,
                                   const ImageI* raw_quant_field,
-                                  const Quantizer* quantizer, bool fast,
+                                  const Quantizer* quantizer,
+                                  const CompressParams& cparams, bool fast,
                                   size_t thread, ColorCorrelationMap* cmap) {
   bool use_dct8 = ac_strategy == nullptr;
   Span<float> scratch(mem.address<float>() + thread * ItemsPerThread(),
                       ItemsPerThread());
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
-      opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer, r,
-      fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, &dc_values, scratch);
+      opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer,
+      cparams, r, fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, &dc_values,
+      scratch);
 }
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,
