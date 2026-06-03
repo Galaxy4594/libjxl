@@ -385,19 +385,28 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
 
   auto evaluate_candidate = [&](const float* m, const float* s,
                                 float multiplier, float base) {
-    float total_cost = 0;
-    for (size_t i = 0; i < num_ac; ++i) {
-      float res = s[i] - (base + multiplier / kDefaultColorFactor) * m[i];
-      float abs_res = std::abs(res);
-      float w = kWeightProfile[i % 64];
-      // Perceptual cost: penalize desaturation (residual opposite to original)
-      // more than oversaturation.
-      float cost = w * abs_res;
-      if (multiplier > 0 && res < 0) cost *= 1.2f;
-      if (multiplier < 0 && res > 0) cost *= 1.2f;
-      total_cost += cost;
+    const auto zero = Zero(df);
+    const auto factor = Set(df, base + multiplier / kDefaultColorFactor);
+    const auto penalty_factor = Set(df, 1.2f);
+    const auto mul_v = Set(df, multiplier);
+    
+    auto total_cost_v = zero;
+    
+    for (size_t i = 0; i < num_ac; i += Lanes(df)) {
+      const auto m_v = Load(df, m + i);
+      const auto s_v = Load(df, s + i);
+      const auto w_v = LoadU(df, kWeightProfile + (i % 64));
+      
+      const auto res_v = Sub(s_v, Mul(factor, m_v));
+      const auto abs_res_v = Abs(res_v);
+      auto cost_v = Mul(w_v, abs_res_v);
+      
+      const auto is_opposite = Lt(Mul(mul_v, res_v), zero);
+      cost_v = IfThenElse(is_opposite, Mul(cost_v, penalty_factor), cost_v);
+      
+      total_cost_v = Add(total_cost_v, cost_v);
     }
-    return total_cost;
+    return GetLane(SumOfLanes(df, total_cost_v));
   };
 
   auto optimize_multipliers = [&](float init_x, float init_b) {
