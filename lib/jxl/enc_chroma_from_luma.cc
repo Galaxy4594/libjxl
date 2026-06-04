@@ -54,29 +54,23 @@ using hwy::HWY_NAMESPACE::Lt;
 
 static HWY_FULL(float) df;
 // Weighted profile to prioritize low-frequency AC coefficients in CfL search.
-// Padded to 128 elements to prevent LoadU out-of-bounds on scalable vectors.
-static const float kWeightProfile[128] = {
+static const float kWeightProfile[64] = {
     0.0f,  3.00f, 3.00f, 2.85f, 2.85f, 2.85f, 2.70f, 2.70f, 2.70f, 2.70f, 2.50f,
     2.50f, 2.50f, 2.50f, 2.50f, 2.30f, 2.30f, 2.30f, 2.30f, 2.30f, 2.30f, 2.10f,
     2.10f, 2.10f, 2.10f, 2.10f, 2.10f, 2.10f, 1.90f, 1.90f, 1.90f, 1.90f, 1.90f,
     1.90f, 1.90f, 1.90f, 1.70f, 1.70f, 1.70f, 1.70f, 1.70f, 1.70f, 1.70f, 1.50f,
     1.50f, 1.50f, 1.50f, 1.50f, 1.50f, 1.30f, 1.30f, 1.30f, 1.30f, 1.30f, 1.15f,
-    1.15f, 1.15f, 1.15f, 1.05f, 1.05f, 1.05f, 1.00f, 1.00f, 1.00f,
-    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
-    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
-    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
-    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
-    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
-    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f};
+    1.15f, 1.15f, 1.15f, 1.05f, 1.05f, 1.05f, 1.00f, 1.00f, 1.00f};
 
 struct CFLFunction {
   static constexpr float kCoeff = 1.f / 3;
   static constexpr float kThres = 100.0f;
   static constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
-  CFLFunction(const float* values_m, const float* values_s, size_t num,
+  CFLFunction(const float* values_m, const float* values_s, const float* values_w, size_t num,
               float base, float distance_mul)
       : values_m(values_m),
         values_s(values_s),
+        values_w(values_w),
         num(num),
         base(base),
         distance_mul(distance_mul) {
@@ -122,7 +116,7 @@ struct CFLFunction {
       dpe = IfThenElse(Lt(vpe, zero), Sub(zero, dpe), dpe);
       dme = IfThenElse(Lt(vme, zero), Sub(zero, dme), dme);
       const auto above = Ge(av, thres);
-      const auto w = LoadU(df, kWeightProfile + (i % 64));
+      const auto w = Load(df, values_w + i);
       // TODO(eustas): use IfThenElseZero
       fd_v = Add(fd_v, Mul(w, IfThenElse(above, zero, d)));
       fdpe_v = Add(fdpe_v, Mul(w, IfThenElse(above, zero, dpe)));
@@ -136,6 +130,7 @@ struct CFLFunction {
 
   const float* JXL_RESTRICT values_m;
   const float* JXL_RESTRICT values_s;
+  const float* JXL_RESTRICT values_w;
   size_t num;
   float base;
   float distance_mul;
@@ -143,7 +138,7 @@ struct CFLFunction {
 
 // Chroma-from-luma search, values_m will have luma -- and values_s chroma.
 int32_t FindBestMultiplier(const float* values_m, const float* values_s,
-                           size_t num, float base, float distance_mul,
+                           const float* values_w, size_t num, float base, float distance_mul,
                            bool fast, float towards_zero) {
   if (num == 0) {
     return 0;
@@ -156,7 +151,7 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
     const auto inv_color_factor = Set(df, kInvColorFactor);
     const auto base_v = Set(df, base);
     for (size_t i = 0; i < num; i += Lanes(df)) {
-      const auto w = LoadU(df, kWeightProfile + (i % 64));
+      const auto w = Load(df, values_w + i);
       // color residual = ax + b
       const auto a = Mul(inv_color_factor, Load(df, values_m + i));
       const auto b =
@@ -170,7 +165,7 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
   } else {
     constexpr float eps = 100;
     constexpr float kClamp = 20.0f;
-    CFLFunction fn(values_m, values_s, num, base, distance_mul);
+    CFLFunction fn(values_m, values_s, values_w, num, base, distance_mul);
     x = 0;
     // Up to 20 Newton iterations, with approximate derivatives.
     // Derivatives are approximate due to the high amount of noise in the exact
@@ -262,7 +257,8 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   float* HWY_RESTRICT coeffs_x = coeffs_yx + kColorTileDim * kColorTileDim;
   float* HWY_RESTRICT coeffs_yb = coeffs_x + kColorTileDim * kColorTileDim;
   float* HWY_RESTRICT coeffs_b = coeffs_yb + kColorTileDim * kColorTileDim;
-  JXL_ENSURE(mem.remove_prefix(4 * kColorTileDim * kColorTileDim));
+  float* HWY_RESTRICT coeffs_w = coeffs_b + kColorTileDim * kColorTileDim;
+  JXL_ENSURE(mem.remove_prefix(5 * kColorTileDim * kColorTileDim));
   constexpr size_t dc_size =
       AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks;
   float* HWY_RESTRICT dc_y = mem.begin();
@@ -349,6 +345,7 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       const float kStrangeMultiplier = 128;
       float q = use_dct8 ? 1 : quantizer->Scale() * kStrangeMultiplier * qq;
       const auto qv = Set(df, q);
+      size_t sx = cx * 8;
       for (size_t i = 0; i < cx * cy * 64; i += Lanes(df)) {
         const auto b_y = Load(df, block_y + i);
         const auto b_x = Load(df, block_x + i);
@@ -359,6 +356,16 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
         Store(Mul(b_x, qqm_x), df, coeffs_x + num_ac);
         Store(Mul(b_y, qqm_b), df, coeffs_yb + num_ac);
         Store(Mul(b_b, qqm_b), df, coeffs_b + num_ac);
+        
+        for (size_t lane = 0; lane < Lanes(df); ++lane) {
+          size_t idx = i + lane;
+          size_t ix = idx % sx;
+          size_t iy = idx / sx;
+          size_t ix_norm = ix / cx;
+          size_t iy_norm = iy / cy;
+          coeffs_w[num_ac + lane] = kWeightProfile[iy_norm * 8 + ix_norm];
+        }
+        
         num_ac += Lanes(df);
       }
     }
@@ -395,7 +402,7 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                                 float multiplier, float base) {
     const auto zero = Zero(df);
     const auto factor = Set(df, base + multiplier / kDefaultColorFactor);
-    const auto penalty_factor = Set(df, 1.2f);
+    const auto oversat_penalty = Set(df, 1.2f);
     const auto mul_v = Set(df, multiplier);
     
     auto total_cost_v = zero;
@@ -403,14 +410,20 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
     for (size_t i = 0; i < num_ac; i += Lanes(df)) {
       const auto m_v = Load(df, m + i);
       const auto s_v = Load(df, s + i);
-      const auto w_v = LoadU(df, kWeightProfile + (i % 64));
+      const auto w_v = Load(df, coeffs_w + i);
       
       const auto res_v = Sub(s_v, Mul(factor, m_v));
       const auto abs_res_v = Abs(res_v);
       auto cost_v = Mul(w_v, abs_res_v);
       
-      const auto is_opposite = Lt(Mul(mul_v, res_v), zero);
-      cost_v = IfThenElse(is_opposite, Mul(cost_v, penalty_factor), cost_v);
+      // Psycho-visual RDO heuristic: Oversaturation Penalty
+      // If the multiplier causes the predicted chroma to overshoot the original
+      // chroma such that the residual (C_orig - C) has the opposite sign of the
+      // applied correlation, it means we are artificially boosting colors.
+      // Oversaturated artifacts are visually jarring, so penalizing them
+      // significantly improves perceptual metrics (SSIMULACRA2, Butteraugli).
+      const auto is_oversat = Lt(Mul(mul_v, res_v), zero);
+      cost_v = IfThenElse(is_oversat, Mul(cost_v, oversat_penalty), cost_v);
       
       total_cost_v = Add(total_cost_v, cost_v);
     }
@@ -437,13 +450,13 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
     return best_m;
   };
 
-  float initial_x = FindBestMultiplier(coeffs_yx, coeffs_x, num_ac, 0.0f,
+  float initial_x = FindBestMultiplier(coeffs_yx, coeffs_x, coeffs_w, num_ac, 0.0f,
                                        kDistanceMultiplierAC, fast,
                                        towards_zero_x);
   row_out_x[tx] = optimize_multiplier(coeffs_yx, coeffs_x, initial_x, 0.0f);
 
   float initial_b =
-      FindBestMultiplier(coeffs_yb, coeffs_b, num_ac, jxl::cms::kYToBRatio,
+      FindBestMultiplier(coeffs_yb, coeffs_b, coeffs_w, num_ac, jxl::cms::kYToBRatio,
                          kDistanceMultiplierAC, fast, towards_zero_b);
   row_out_b[tx] =
       optimize_multiplier(coeffs_yb, coeffs_b, initial_b, jxl::cms::kYToBRatio);
