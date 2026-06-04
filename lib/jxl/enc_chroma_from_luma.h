@@ -55,13 +55,6 @@ struct CfLHeuristics {
                      const CompressParams& cparams, bool fast, size_t thread,
                      ColorCorrelationMap* cmap);
 
-  Status RefineMap(const Image3F& opsin, const Rect& opsin_rect,
-                   const DequantMatrices& dequant,
-                   const AcStrategyImage& ac_strategy,
-                   const ImageI& raw_quant_field, const Quantizer& quantizer,
-                   const CompressParams& cparams, ThreadPool* pool,
-                   ColorCorrelationMap* cmap);
-
   JxlMemoryManager* memory_manager;
   ImageF dc_values;
   AlignedMemory mem;

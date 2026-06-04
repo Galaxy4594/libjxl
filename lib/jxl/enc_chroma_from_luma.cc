@@ -222,9 +222,7 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const ImageI* raw_quant_field, const Quantizer* quantizer,
                    const CompressParams& cparams, const Rect& rect, bool fast,
                    bool use_dct8, ImageSB* map_x, ImageSB* map_b,
-                   ImageF* dc_values, Span<float> mem,
-                   const ImageSB* old_ytox = nullptr,
-                   const ImageSB* old_ytob = nullptr) {
+                   ImageF* dc_values, Span<float> mem) {
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
                 "Invalid color tile dim");
   size_t xsize_blocks = opsin_rect.xsize() / kBlockDim;
@@ -406,76 +404,39 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       
       total_cost_v = Add(total_cost_v, cost_v);
     }
-    return GetLane(SumOfLanes(df, total_cost_v));
+    float total_cost = GetLane(SumOfLanes(df, total_cost_v));
+    total_cost += std::abs(multiplier) * 0.1f;
+    return total_cost;
   };
 
-  auto optimize_multipliers = [&](float init_x, float init_b) {
+  auto optimize_multiplier = [&](const float* m, const float* s, float initial,
+                                 float base) {
     if (cparams.speed_tier > SpeedTier::kSquirrel || fast) {
-      return std::make_pair((int32_t)std::round(init_x),
-                            (int32_t)std::round(init_b));
+      return (int32_t)std::round(initial);
     }
-    int32_t best_x = std::round(init_x);
-    int32_t best_b = std::round(init_b);
-
-    auto total_cost = [&](int32_t cand_x, int32_t cand_b) {
-      float cost_x = evaluate_candidate(coeffs_yx, coeffs_x, cand_x, 0.0f) +
-                     std::abs(cand_x) * 0.1f;
-      float cost_b = evaluate_candidate(coeffs_yb, coeffs_b, cand_b,
-                                        jxl::cms::kYToBRatio) +
-                     std::abs(cand_b) * 0.1f;
-      // Joint entropy penalty: encourages YToX and YToB to be closer,
-      // saving bits in the Modular stream predicting one from the other.
-      float joint_cost = std::abs(cand_x - cand_b) * 0.05f;
-
-      if (old_ytox && old_ytob) {
-        int32_t left_x = (tx > 0) ? old_ytox->Row(ty)[tx - 1] : 0;
-        int32_t top_x = (ty > 0) ? old_ytox->Row(ty - 1)[tx] : 0;
-        int32_t pred_x = (left_x + top_x) / 2;
-
-        int32_t left_b = (tx > 0) ? old_ytob->Row(ty)[tx - 1] : 0;
-        int32_t top_b = (ty > 0) ? old_ytob->Row(ty - 1)[tx] : 0;
-        int32_t pred_b = (left_b + top_b) / 2;
-
-        joint_cost += std::abs(cand_x - pred_x) * 0.05f;
-        joint_cost += std::abs(cand_b - pred_b) * 0.05f;
-      }
-      return cost_x + cost_b + joint_cost;
-    };
-
-    float best_cost = total_cost(best_x, best_b);
-
-    for (int dx : {-2, -1, 0, 1, 2}) {
-      for (int db : {-2, -1, 0, 1, 2}) {
-        if (dx == 0 && db == 0) continue;
-        int32_t cand_x = jxl::Clamp1(best_x + dx, -128, 127);
-        int32_t cand_b = jxl::Clamp1(best_b + db, -128, 127);
-        float cost = total_cost(cand_x, cand_b);
-        if (cost < best_cost) {
-          best_cost = cost;
-          best_x = cand_x;
-          best_b = cand_b;
-        }
+    int32_t best_m = std::round(initial);
+    float best_cost = evaluate_candidate(m, s, best_m, base);
+    for (int delta : {-2, -1, 1, 2}) {
+      int32_t cand = jxl::Clamp1(best_m + delta, -128, 127);
+      float cost = evaluate_candidate(m, s, cand, base);
+      if (cost < best_cost) {
+        best_cost = cost;
+        best_m = cand;
       }
     }
-    return std::make_pair(best_x, best_b);
+    return best_m;
   };
 
-  float initial_x;
-  float initial_b;
-  if (old_ytox && old_ytob) {
-    initial_x = old_ytox->Row(ty)[tx];
-    initial_b = old_ytob->Row(ty)[tx];
-  } else {
-    initial_x = FindBestMultiplier(coeffs_yx, coeffs_x, num_ac, 0.0f,
-                                   kDistanceMultiplierAC, fast, towards_zero_x);
-    initial_b =
-        FindBestMultiplier(coeffs_yb, coeffs_b, num_ac, jxl::cms::kYToBRatio,
-                           kDistanceMultiplierAC, fast, towards_zero_b);
-  }
+  float initial_x = FindBestMultiplier(coeffs_yx, coeffs_x, num_ac, 0.0f,
+                                       kDistanceMultiplierAC, fast,
+                                       towards_zero_x);
+  row_out_x[tx] = optimize_multiplier(coeffs_yx, coeffs_x, initial_x, 0.0f);
 
-  auto best_multipliers = optimize_multipliers(initial_x, initial_b);
-  row_out_x[tx] = best_multipliers.first;
-  row_out_b[tx] = best_multipliers.second;
+  float initial_b =
+      FindBestMultiplier(coeffs_yb, coeffs_b, num_ac, jxl::cms::kYToBRatio,
+                         kDistanceMultiplierAC, fast, towards_zero_b);
+  row_out_b[tx] =
+      optimize_multiplier(coeffs_yb, coeffs_b, initial_b, jxl::cms::kYToBRatio);
   return true;
 }
 
@@ -511,55 +472,9 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
       opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer,
       cparams, r, fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, &dc_values,
-      scratch, nullptr, nullptr);
+      scratch);
 }
 
-Status CfLHeuristics::RefineMap(const Image3F& opsin, const Rect& opsin_rect,
-                                const DequantMatrices& dequant,
-                                const AcStrategyImage& ac_strategy,
-                                const ImageI& raw_quant_field,
-                                const Quantizer& quantizer,
-                                const CompressParams& cparams, ThreadPool* pool,
-                                ColorCorrelationMap* cmap) {
-  JxlMemoryManager* memory_manager = opsin.memory_manager();
-
-  // Create copies of the original maps
-  JXL_ASSIGN_OR_RETURN(ImageSB old_ytox,
-                       ImageSB::Create(memory_manager, cmap->ytox_map.xsize(),
-                                       cmap->ytox_map.ysize()));
-  JXL_RETURN_IF_ERROR(CopyImageTo(cmap->ytox_map, &old_ytox));
-
-  JXL_ASSIGN_OR_RETURN(ImageSB old_ytob,
-                       ImageSB::Create(memory_manager, cmap->ytob_map.xsize(),
-                                       cmap->ytob_map.ysize()));
-  JXL_RETURN_IF_ERROR(CopyImageTo(cmap->ytob_map, &old_ytob));
-
-  size_t xsize_blocks = opsin_rect.xsize() / kBlockDim;
-  size_t ysize_blocks = opsin_rect.ysize() / kBlockDim;
-  size_t n_enc_tiles = DivCeil(xsize_blocks, kEncTileDimInBlocks);
-  size_t num_tiles = n_enc_tiles * DivCeil(ysize_blocks, kEncTileDimInBlocks);
-
-  auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
-    size_t tx = tid % n_enc_tiles;
-    size_t ty = tid / n_enc_tiles;
-    size_t by0 = ty * kEncTileDimInBlocks;
-    size_t by1 = std::min((ty + 1) * kEncTileDimInBlocks, ysize_blocks);
-    size_t bx0 = tx * kEncTileDimInBlocks;
-    size_t bx1 = std::min((tx + 1) * kEncTileDimInBlocks, xsize_blocks);
-    Rect r(bx0, by0, bx1 - bx0, by1 - by0);
-
-    Span<float> scratch(mem.address<float>() + thread * ItemsPerThread(),
-                        ItemsPerThread());
-
-    return HWY_DYNAMIC_DISPATCH(ComputeTile)(
-        opsin, opsin_rect, dequant, &ac_strategy, &raw_quant_field, &quantizer,
-        cparams, r, /*fast=*/false, /*use_dct8=*/false, &cmap->ytox_map,
-        &cmap->ytob_map, &dc_values, scratch, &old_ytox, &old_ytob);
-  };
-
-  return RunOnPool(pool, 0, num_tiles, ThreadPool::NoInit, process_tile,
-                   "Refine CfL");
-}
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,
                                 BitWriter* writer, LayerType layer,

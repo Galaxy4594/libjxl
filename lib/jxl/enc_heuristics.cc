@@ -1207,12 +1207,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
-  if (cparams.speed_tier <= SpeedTier::kSquirrel) {
-    JXL_RETURN_IF_ERROR(cfl_heuristics.RefineMap(
-        *opsin, rect, matrices, ac_strategy, raw_quant_field, quantizer,
-        cparams, pool, &cmap));
-  }
-
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
     ImageB& epf_sharpness = shared.epf_sharpness;
