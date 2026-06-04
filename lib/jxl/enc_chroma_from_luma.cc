@@ -54,13 +54,20 @@ using hwy::HWY_NAMESPACE::Lt;
 
 static HWY_FULL(float) df;
 // Weighted profile to prioritize low-frequency AC coefficients in CfL search.
-static const float kWeightProfile[64] = {
+// Padded to 128 elements to prevent LoadU out-of-bounds on scalable vectors.
+static const float kWeightProfile[128] = {
     0.0f,  3.00f, 3.00f, 2.85f, 2.85f, 2.85f, 2.70f, 2.70f, 2.70f, 2.70f, 2.50f,
     2.50f, 2.50f, 2.50f, 2.50f, 2.30f, 2.30f, 2.30f, 2.30f, 2.30f, 2.30f, 2.10f,
     2.10f, 2.10f, 2.10f, 2.10f, 2.10f, 2.10f, 1.90f, 1.90f, 1.90f, 1.90f, 1.90f,
     1.90f, 1.90f, 1.90f, 1.70f, 1.70f, 1.70f, 1.70f, 1.70f, 1.70f, 1.70f, 1.50f,
     1.50f, 1.50f, 1.50f, 1.50f, 1.50f, 1.30f, 1.30f, 1.30f, 1.30f, 1.30f, 1.15f,
-    1.15f, 1.15f, 1.15f, 1.05f, 1.05f, 1.05f, 1.00f, 1.00f, 1.00f};
+    1.15f, 1.15f, 1.15f, 1.05f, 1.05f, 1.05f, 1.00f, 1.00f, 1.00f,
+    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
+    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
+    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
+    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
+    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
+    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f};
 
 struct CFLFunction {
   static constexpr float kCoeff = 1.f / 3;
@@ -367,14 +374,17 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   float towards_zero_x = 2.6f;
   float towards_zero_b = 2.6f;
 
+  JXL_ENSURE(num_ac % Lanes(df) == 0);
   if (num_ac > 0) {
-    auto sum_abs = [](const float* f, size_t n) {
-      float s = 0.0f;
-      for (size_t i = 0; i < n; ++i) s += std::abs(f[i]);
-      return s / n;
+    auto sum_abs_simd = [](const float* f, size_t n) {
+      auto sum_v = Zero(df);
+      for (size_t i = 0; i < n; i += Lanes(df)) {
+        sum_v = Add(sum_v, Abs(Load(df, f + i)));
+      }
+      return GetLane(SumOfLanes(df, sum_v)) / n;
     };
-    float energy_x = sum_abs(coeffs_x, num_ac);
-    float energy_b = sum_abs(coeffs_b, num_ac);
+    float energy_x = sum_abs_simd(coeffs_x, num_ac);
+    float energy_b = sum_abs_simd(coeffs_b, num_ac);
 
     // If there's significant AC energy in chroma, it's likely a saturated edge.
     if (energy_x > 0.1f) towards_zero_x = 1.2f;
