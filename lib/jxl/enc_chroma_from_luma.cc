@@ -30,10 +30,8 @@
 #include <hwy/highway.h>
 
 #include "lib/jxl/base/common.h"
-#include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/cms/color_encoding_cms.h"
 #include "lib/jxl/cms/opsin_params.h"
 #include "lib/jxl/dec_transforms-inl.h"
 #include "lib/jxl/enc_aux_out.h"
@@ -55,19 +53,23 @@ using hwy::HWY_NAMESPACE::Lt;
 static HWY_FULL(float) df;
 // Weighted profile to prioritize low-frequency AC coefficients in CfL search.
 static const float kWeightProfile[64] = {
-    0.0f,  3.00f, 3.00f, 2.85f, 2.85f, 2.85f, 2.70f, 2.70f, 2.70f, 2.70f, 2.50f,
-    2.50f, 2.50f, 2.50f, 2.50f, 2.30f, 2.30f, 2.30f, 2.30f, 2.30f, 2.30f, 2.10f,
-    2.10f, 2.10f, 2.10f, 2.10f, 2.10f, 2.10f, 1.90f, 1.90f, 1.90f, 1.90f, 1.90f,
-    1.90f, 1.90f, 1.90f, 1.70f, 1.70f, 1.70f, 1.70f, 1.70f, 1.70f, 1.70f, 1.50f,
-    1.50f, 1.50f, 1.50f, 1.50f, 1.50f, 1.30f, 1.30f, 1.30f, 1.30f, 1.30f, 1.15f,
-    1.15f, 1.15f, 1.15f, 1.05f, 1.05f, 1.05f, 1.00f, 1.00f, 1.00f};
+    0.00f, 3.00f, 3.00f, 2.85f, 2.85f, 2.85f, 2.70f, 2.70f,
+    2.70f, 2.70f, 2.50f, 2.50f, 2.50f, 2.50f, 2.50f, 2.30f,
+    2.30f, 2.30f, 2.30f, 2.30f, 2.30f, 2.10f, 2.10f, 2.10f,
+    2.10f, 2.10f, 2.10f, 2.10f, 1.90f, 1.90f, 1.90f, 1.90f,
+    1.90f, 1.90f, 1.90f, 1.90f, 1.70f, 1.70f, 1.70f, 1.70f,
+    1.70f, 1.70f, 1.70f, 1.50f, 1.50f, 1.50f, 1.50f, 1.50f,
+    1.50f, 1.30f, 1.30f, 1.30f, 1.30f, 1.30f, 1.15f, 1.15f,
+    1.15f, 1.15f, 1.05f, 1.05f, 1.05f, 1.00f, 1.00f, 1.00f,
+};
 
 struct CFLFunction {
   static constexpr float kCoeff = 1.f / 3;
   static constexpr float kThres = 100.0f;
   static constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
-  CFLFunction(const float* values_m, const float* values_s, const float* values_w, size_t num,
-              float base, float distance_mul)
+  CFLFunction(const float* values_m, const float* values_s,
+              const float* values_w, size_t num, float base,
+              float distance_mul)
       : values_m(values_m),
         values_s(values_s),
         values_w(values_w),
@@ -138,8 +140,9 @@ struct CFLFunction {
 
 // Chroma-from-luma search, values_m will have luma -- and values_s chroma.
 int32_t FindBestMultiplier(const float* values_m, const float* values_s,
-                           const float* values_w, size_t num, float base, float distance_mul,
-                           bool fast, float towards_zero) {
+                           const float* values_w, size_t num, float base,
+                           float distance_mul, bool fast,
+                           float towards_zero) {
   if (num == 0) {
     return 0;
   }
@@ -321,8 +324,9 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
         continue;
       }
 
-      // Copy AC coefficients in the local block. The order in which
-      // coefficients get stored does not matter.
+      // Copy AC coefficients in the local block and compute per-coefficient
+      // frequency weights. Coefficients are stored in raster order within the
+      // CoefficientLayout-canonical block dimensions (cx >= cy).
       size_t cx = acs.covered_blocks_x();
       size_t cy = acs.covered_blocks_y();
       CoefficientLayout(&cy, &cx);
@@ -346,6 +350,17 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       float q = use_dct8 ? 1 : quantizer->Scale() * kStrangeMultiplier * qq;
       const auto qv = Set(df, q);
       size_t sx = cx * 8;
+      size_t sy = cy * 8;
+      size_t shift_x = __builtin_ctz(cx);
+      size_t shift_y = __builtin_ctz(cy);
+      for (size_t iy = 0; iy < sy; ++iy) {
+        size_t iy_norm = iy >> shift_y;
+        for (size_t ix = 0; ix < sx; ++ix) {
+          size_t ix_norm = ix >> shift_x;
+          coeffs_w[num_ac + iy * sx + ix] = kWeightProfile[iy_norm * 8 + ix_norm];
+        }
+      }
+      
       for (size_t i = 0; i < cx * cy * 64; i += Lanes(df)) {
         const auto b_y = Load(df, block_y + i);
         const auto b_x = Load(df, block_x + i);
@@ -356,21 +371,12 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
         Store(Mul(b_x, qqm_x), df, coeffs_x + num_ac);
         Store(Mul(b_y, qqm_b), df, coeffs_yb + num_ac);
         Store(Mul(b_b, qqm_b), df, coeffs_b + num_ac);
-        
-        for (size_t lane = 0; lane < Lanes(df); ++lane) {
-          size_t idx = i + lane;
-          size_t ix = idx % sx;
-          size_t iy = idx / sx;
-          size_t ix_norm = ix / cx;
-          size_t iy_norm = iy / cy;
-          coeffs_w[num_ac + lane] = kWeightProfile[iy_norm * 8 + ix_norm];
-        }
-        
+
         num_ac += Lanes(df);
       }
     }
   }
-  // Path 3: Adaptive CfL quantization.
+  // Adaptive CfL deadzone.
   // The standard fixed deadzone (2.6) often wipes out chroma correlation on
   // saturated edges at low bitrates, leading to a "leap to white" artifact
   // (the Helmholtz-Kohlrausch effect where desaturated pixels look too bright).
@@ -383,39 +389,46 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
 
   JXL_ENSURE(num_ac % Lanes(df) == 0);
   if (num_ac > 0) {
-    auto sum_abs_simd = [](const float* f, size_t n) {
+    auto mean_abs = [](const float* f, size_t n) {
       auto sum_v = Zero(df);
       for (size_t i = 0; i < n; i += Lanes(df)) {
         sum_v = Add(sum_v, Abs(Load(df, f + i)));
       }
       return GetLane(SumOfLanes(df, sum_v)) / n;
     };
-    float energy_x = sum_abs_simd(coeffs_x, num_ac);
-    float energy_b = sum_abs_simd(coeffs_b, num_ac);
+    float energy_x = mean_abs(coeffs_x, num_ac);
+    float energy_b = mean_abs(coeffs_b, num_ac);
 
-    // If there's significant AC energy in chroma, it's likely a saturated edge.
-    if (energy_x > 0.1f) towards_zero_x = 1.2f;
-    if (energy_b > 0.1f) towards_zero_b = 1.0f;
+    // If there's significant AC energy in chroma, it's likely a saturated
+    // edge — reduce the deadzone to preserve color fidelity.
+    constexpr float kChromaEnergyThreshold = 0.1f;
+    constexpr float kReducedDeadzoneX = 1.2f;
+    constexpr float kReducedDeadzoneB = 1.0f;
+    if (energy_x > kChromaEnergyThreshold) towards_zero_x = kReducedDeadzoneX;
+    if (energy_b > kChromaEnergyThreshold) towards_zero_b = kReducedDeadzoneB;
   }
+
+  constexpr float kOversatPenaltyFactor = 1.2f;
+  constexpr float kMultiplierBitCost = 0.1f;
 
   auto evaluate_candidate = [&](const float* m, const float* s,
                                 float multiplier, float base) {
     const auto zero = Zero(df);
     const auto factor = Set(df, base + multiplier / kDefaultColorFactor);
-    const auto oversat_penalty = Set(df, 1.2f);
+    const auto oversat_penalty = Set(df, kOversatPenaltyFactor);
     const auto mul_v = Set(df, multiplier);
-    
+
     auto total_cost_v = zero;
-    
+
     for (size_t i = 0; i < num_ac; i += Lanes(df)) {
       const auto m_v = Load(df, m + i);
       const auto s_v = Load(df, s + i);
       const auto w_v = Load(df, coeffs_w + i);
-      
+
       const auto res_v = Sub(s_v, Mul(factor, m_v));
       const auto abs_res_v = Abs(res_v);
       auto cost_v = Mul(w_v, abs_res_v);
-      
+
       // Psycho-visual RDO heuristic: Oversaturation Penalty
       // If the multiplier causes the predicted chroma to overshoot the original
       // chroma such that the residual (C_orig - C) has the opposite sign of the
@@ -424,23 +437,26 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       // significantly improves perceptual metrics (SSIMULACRA2, Butteraugli).
       const auto is_oversat = Lt(Mul(mul_v, res_v), zero);
       cost_v = IfThenElse(is_oversat, Mul(cost_v, oversat_penalty), cost_v);
-      
+
       total_cost_v = Add(total_cost_v, cost_v);
     }
     float total_cost = GetLane(SumOfLanes(df, total_cost_v));
-    total_cost += std::abs(multiplier) * 0.1f;
+    total_cost += std::abs(multiplier) * kMultiplierBitCost;
     return total_cost;
   };
 
   auto optimize_multiplier = [&](const float* m, const float* s, float initial,
                                  float base) {
     if (cparams.speed_tier > SpeedTier::kSquirrel || fast) {
-      return (int32_t)std::round(initial);
+      return static_cast<int32_t>(std::round(initial));
     }
-    int32_t best_m = std::round(initial);
+    int32_t best_m = static_cast<int32_t>(std::round(initial));
     float best_cost = evaluate_candidate(m, s, best_m, base);
+    int32_t last_cand = best_m;
     for (int delta : {-2, -1, 1, 2}) {
       int32_t cand = jxl::Clamp1(best_m + delta, -128, 127);
+      if (cand == last_cand || cand == best_m) continue;
+      last_cand = cand;
       float cost = evaluate_candidate(m, s, cand, base);
       if (cost < best_cost) {
         best_cost = cost;
@@ -497,7 +513,6 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
       cparams, r, fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, &dc_values,
       scratch);
 }
-
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,
                                 BitWriter* writer, LayerType layer,

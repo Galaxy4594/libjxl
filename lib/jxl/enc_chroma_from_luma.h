@@ -29,7 +29,6 @@ namespace jxl {
 struct AuxOut;
 enum class LayerType : uint8_t;
 class Quantizer;
-class ThreadPool;
 struct CompressParams;
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,
