@@ -45,160 +45,34 @@ namespace HWY_NAMESPACE {
 
 // These templates are not found via ADL.
 using hwy::HWY_NAMESPACE::Abs;
+using hwy::HWY_NAMESPACE::Add;
 using hwy::HWY_NAMESPACE::Ge;
 using hwy::HWY_NAMESPACE::GetLane;
 using hwy::HWY_NAMESPACE::IfThenElse;
 using hwy::HWY_NAMESPACE::Lt;
+using hwy::HWY_NAMESPACE::Mul;
+using hwy::HWY_NAMESPACE::MulAdd;
+using hwy::HWY_NAMESPACE::SumOfLanes;
+using hwy::HWY_NAMESPACE::Zero;
 
 static HWY_FULL(float) df;
-// Weighted profile to prioritize low-frequency AC coefficients in CfL search.
-static const float kWeightProfile[64] = {
-    0.00f, 3.00f, 3.00f, 2.85f, 2.85f, 2.85f, 2.70f, 2.70f,
-    2.70f, 2.70f, 2.50f, 2.50f, 2.50f, 2.50f, 2.50f, 2.30f,
-    2.30f, 2.30f, 2.30f, 2.30f, 2.30f, 2.10f, 2.10f, 2.10f,
-    2.10f, 2.10f, 2.10f, 2.10f, 1.90f, 1.90f, 1.90f, 1.90f,
-    1.90f, 1.90f, 1.90f, 1.90f, 1.70f, 1.70f, 1.70f, 1.70f,
-    1.70f, 1.70f, 1.70f, 1.50f, 1.50f, 1.50f, 1.50f, 1.50f,
-    1.50f, 1.30f, 1.30f, 1.30f, 1.30f, 1.30f, 1.15f, 1.15f,
-    1.15f, 1.15f, 1.05f, 1.05f, 1.05f, 1.00f, 1.00f, 1.00f,
+struct WeightProfile {
+  float w[64];
+  WeightProfile() {
+    float max_r = std::sqrt(7.0f * 7.0f + 7.0f * 7.0f);
+    for (int y = 0; y < 8; ++y) {
+      for (int x = 0; x < 8; ++x) {
+        if (x == 0 && y == 0) {
+          w[0] = 0.0f;
+        } else {
+          float r = std::sqrt(static_cast<float>(x * x + y * y));
+          w[y * 8 + x] = 1.0f + 2.0f * (1.0f - r / max_r);
+        }
+      }
+    }
+  }
 };
-
-struct CFLFunction {
-  static constexpr float kCoeff = 1.f / 3;
-  static constexpr float kThres = 100.0f;
-  static constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
-  CFLFunction(const float* values_m, const float* values_s,
-              const float* values_w, size_t num, float base,
-              float distance_mul)
-      : values_m(values_m),
-        values_s(values_s),
-        values_w(values_w),
-        num(num),
-        base(base),
-        distance_mul(distance_mul) {
-    JXL_DASSERT(num % Lanes(df) == 0);
-  }
-
-  // Returns f'(x), where f is 1/3 * sum ((|color residual| + 1)^2-1) +
-  // distance_mul * x^2 * num.
-  float Compute(float x, float eps, float* fpeps, float* fmeps) const {
-    float first_derivative = 2 * distance_mul * num * x;
-    float first_derivative_peps = 2 * distance_mul * num * (x + eps);
-    float first_derivative_meps = 2 * distance_mul * num * (x - eps);
-
-    const auto inv_color_factor = Set(df, kInvColorFactor);
-    const auto thres = Set(df, kThres);
-    const auto coeffx2 = Set(df, kCoeff * 2.0f);
-    const auto one = Set(df, 1.0f);
-    const auto zero = Set(df, 0.0f);
-    const auto base_v = Set(df, base);
-    const auto x_v = Set(df, x);
-    const auto xpe_v = Set(df, x + eps);
-    const auto xme_v = Set(df, x - eps);
-    auto fd_v = Zero(df);
-    auto fdpe_v = Zero(df);
-    auto fdme_v = Zero(df);
-
-    for (size_t i = 0; i < num; i += Lanes(df)) {
-      // color residual = ax + b
-      const auto a = Mul(inv_color_factor, Load(df, values_m + i));
-      const auto b =
-          Sub(Mul(base_v, Load(df, values_m + i)), Load(df, values_s + i));
-      const auto v = MulAdd(a, x_v, b);
-      const auto vpe = MulAdd(a, xpe_v, b);
-      const auto vme = MulAdd(a, xme_v, b);
-      const auto av = Abs(v);
-      const auto avpe = Abs(vpe);
-      const auto avme = Abs(vme);
-      const auto acoeffx2 = Mul(coeffx2, a);
-      auto d = Mul(acoeffx2, Add(av, one));
-      auto dpe = Mul(acoeffx2, Add(avpe, one));
-      auto dme = Mul(acoeffx2, Add(avme, one));
-      d = IfThenElse(Lt(v, zero), Sub(zero, d), d);
-      dpe = IfThenElse(Lt(vpe, zero), Sub(zero, dpe), dpe);
-      dme = IfThenElse(Lt(vme, zero), Sub(zero, dme), dme);
-      const auto above = Ge(av, thres);
-      const auto w = Load(df, values_w + i);
-      // TODO(eustas): use IfThenElseZero
-      fd_v = Add(fd_v, Mul(w, IfThenElse(above, zero, d)));
-      fdpe_v = Add(fdpe_v, Mul(w, IfThenElse(above, zero, dpe)));
-      fdme_v = Add(fdme_v, Mul(w, IfThenElse(above, zero, dme)));
-    }
-
-    *fpeps = first_derivative_peps + GetLane(SumOfLanes(df, fdpe_v));
-    *fmeps = first_derivative_meps + GetLane(SumOfLanes(df, fdme_v));
-    return first_derivative + GetLane(SumOfLanes(df, fd_v));
-  }
-
-  const float* JXL_RESTRICT values_m;
-  const float* JXL_RESTRICT values_s;
-  const float* JXL_RESTRICT values_w;
-  size_t num;
-  float base;
-  float distance_mul;
-};
-
-// Chroma-from-luma search, values_m will have luma -- and values_s chroma.
-int32_t FindBestMultiplier(const float* values_m, const float* values_s,
-                           const float* values_w, size_t num, float base,
-                           float distance_mul, bool fast,
-                           float towards_zero) {
-  if (num == 0) {
-    return 0;
-  }
-  float x;
-  if (fast) {
-    static constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
-    auto ca = Zero(df);
-    auto cb = Zero(df);
-    const auto inv_color_factor = Set(df, kInvColorFactor);
-    const auto base_v = Set(df, base);
-    for (size_t i = 0; i < num; i += Lanes(df)) {
-      const auto w = Load(df, values_w + i);
-      // color residual = ax + b
-      const auto a = Mul(inv_color_factor, Load(df, values_m + i));
-      const auto b =
-          Sub(Mul(base_v, Load(df, values_m + i)), Load(df, values_s + i));
-      ca = MulAdd(Mul(w, a), a, ca);
-      cb = MulAdd(Mul(w, a), b, cb);
-    }
-    // + distance_mul * x^2 * num
-    x = -GetLane(SumOfLanes(df, cb)) /
-        (GetLane(SumOfLanes(df, ca)) + num * distance_mul * 0.5f);
-  } else {
-    constexpr float eps = 100;
-    constexpr float kClamp = 20.0f;
-    CFLFunction fn(values_m, values_s, values_w, num, base, distance_mul);
-    x = 0;
-    // Up to 20 Newton iterations, with approximate derivatives.
-    // Derivatives are approximate due to the high amount of noise in the exact
-    // derivatives.
-    for (size_t i = 0; i < 20; i++) {
-      float dfpeps;
-      float dfmeps;
-      float d_f = fn.Compute(x, eps, &dfpeps, &dfmeps);
-      float ddf = (dfpeps - dfmeps) / (2 * eps);
-      float kExperimentalInsignificantStabilizer = 0.85;
-      float step = d_f / (ddf + kExperimentalInsignificantStabilizer);
-      x -= std::min(kClamp, std::max(-kClamp, step));
-      if (std::abs(step) < 3e-3) break;
-    }
-  }
-  // CFL seems to be tricky for larger transforms for HF components
-  // close to zero. This heuristic brings the solutions closer to zero
-  // and reduces red-green oscillations. A better approach would
-  // look into variance of the multiplier within separate (e.g. 8x8)
-  // areas and only apply this heuristic where there is a high variance.
-  // This would give about 1 % more compression density.
-  if (x >= towards_zero) {
-    x -= towards_zero;
-  } else if (x <= -towards_zero) {
-    x += towards_zero;
-  } else {
-    x = 0;
-  }
-  return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
-}
+static const WeightProfile kWeightProfile;
 
 Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,
                      ImageF* dc_values) {
@@ -231,7 +105,6 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
                 "Invalid color tile dim");
   size_t xsize_blocks = opsin_rect.xsize() / kBlockDim;
-  constexpr float kDistanceMultiplierAC = 1e-9f;
   const size_t dct_scratch_size =
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
 
@@ -272,6 +145,8 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   JXL_ENSURE(mem.size() == 2 * AcStrategy::kMaxCoeffArea + dct_scratch_size);
 
   size_t num_ac = 0;
+  float tile_q = 0.0f;
+  int num_blocks = 0;
 
   for (size_t y = y0; y < y1; ++y) {
     const float* JXL_RESTRICT row_y =
@@ -344,10 +219,9 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       // than the previous approach which was also a hack.)
       const float qq =
           (raw_quant_field == nullptr) ? 1.0f : raw_quant_field->Row(y)[x];
-      // Experimentally values 128-130 seem best -- I don't know why we
-      // need this multiplier.
-      const float kStrangeMultiplier = 128;
-      float q = use_dct8 ? 1 : quantizer->Scale() * kStrangeMultiplier * qq;
+      float q = use_dct8 ? 1.0f : (quantizer->Scale() * qq);
+      tile_q += q;
+      num_blocks++;
       const auto qv = Set(df, q);
       size_t sx = cx * 8;
       size_t sy = cy * 8;
@@ -357,10 +231,11 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
         size_t iy_norm = iy >> shift_y;
         for (size_t ix = 0; ix < sx; ++ix) {
           size_t ix_norm = ix >> shift_x;
-          coeffs_w[num_ac + iy * sx + ix] = kWeightProfile[iy_norm * 8 + ix_norm];
+          coeffs_w[num_ac + iy * sx + ix] =
+              kWeightProfile.w[iy_norm * 8 + ix_norm];
         }
       }
-      
+
       for (size_t i = 0; i < cx * cy * 64; i += Lanes(df)) {
         const auto b_y = Load(df, block_y + i);
         const auto b_x = Load(df, block_x + i);
@@ -376,106 +251,203 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       }
     }
   }
-  // Adaptive CfL deadzone.
-  // The standard fixed deadzone (2.6) often wipes out chroma correlation on
-  // saturated edges at low bitrates, leading to a "leap to white" artifact
-  // (the Helmholtz-Kohlrausch effect where desaturated pixels look too bright).
-  // By reducing this deadzone based on tile energy,
-  // we preserve the chroma signal while still avoiding noise in near-neutral
-  // areas. This improves perceptual metrics (SSIMULACRA2) and maintains
-  // color fidelity on vivid edges.
-  float towards_zero_x = 2.6f;
-  float towards_zero_b = 2.6f;
-
-  JXL_ENSURE(num_ac % Lanes(df) == 0);
-  if (num_ac > 0) {
-    auto mean_abs = [](const float* f, size_t n) {
-      auto sum_v = Zero(df);
-      for (size_t i = 0; i < n; i += Lanes(df)) {
-        sum_v = Add(sum_v, Abs(Load(df, f + i)));
-      }
-      return GetLane(SumOfLanes(df, sum_v)) / n;
-    };
-    float energy_x = mean_abs(coeffs_x, num_ac);
-    float energy_b = mean_abs(coeffs_b, num_ac);
-
-    // If there's significant AC energy in chroma, it's likely a saturated
-    // edge — reduce the deadzone to preserve color fidelity.
-    constexpr float kChromaEnergyThreshold = 0.1f;
-    constexpr float kReducedDeadzoneX = 1.2f;
-    constexpr float kReducedDeadzoneB = 1.0f;
-    if (energy_x > kChromaEnergyThreshold) towards_zero_x = kReducedDeadzoneX;
-    if (energy_b > kChromaEnergyThreshold) towards_zero_b = kReducedDeadzoneB;
-  }
-
   constexpr float kOversatPenaltyFactor = 1.2f;
-  constexpr float kMultiplierBitCost = 0.1f;
+  constexpr float kMultiplierBitCost = 0.05f;
 
-  auto evaluate_candidate = [&](const float* m, const float* s,
-                                float multiplier, float base) {
-    const auto zero = Zero(df);
-    const auto factor = Set(df, base + multiplier / kDefaultColorFactor);
-    const auto oversat_penalty = Set(df, kOversatPenaltyFactor);
-    const auto mul_v = Set(df, multiplier);
-
-    auto total_cost_v = zero;
-
-    for (size_t i = 0; i < num_ac; i += Lanes(df)) {
-      const auto m_v = Load(df, m + i);
-      const auto s_v = Load(df, s + i);
-      const auto w_v = Load(df, coeffs_w + i);
-
-      const auto res_v = Sub(s_v, Mul(factor, m_v));
-      const auto abs_res_v = Abs(res_v);
-      auto cost_v = Mul(w_v, abs_res_v);
-
-      // Psycho-visual RDO heuristic: Oversaturation Penalty
-      // If the multiplier causes the predicted chroma to overshoot the original
-      // chroma such that the residual (C_orig - C) has the opposite sign of the
-      // applied correlation, it means we are artificially boosting colors.
-      // Oversaturated artifacts are visually jarring, so penalizing them
-      // significantly improves perceptual metrics (SSIMULACRA2, Butteraugli).
-      const auto is_oversat = Lt(Mul(mul_v, res_v), zero);
-      cost_v = IfThenElse(is_oversat, Mul(cost_v, oversat_penalty), cost_v);
-
-      total_cost_v = Add(total_cost_v, cost_v);
-    }
-    float total_cost = GetLane(SumOfLanes(df, total_cost_v));
-    total_cost += std::abs(multiplier) * kMultiplierBitCost;
-    return total_cost;
+  auto get_pred = [](const ImageSB* map, int tx, int ty) {
+    if (tx == 0 && ty == 0) return 0;
+    if (tx == 0) return (int)map->Row(ty - 1)[tx];
+    if (ty == 0) return (int)map->Row(ty)[tx - 1];
+    int left = map->Row(ty)[tx - 1];
+    int top = map->Row(ty - 1)[tx];
+    int topleft = map->Row(ty - 1)[tx - 1];
+    int gradient = left + top - topleft;
+    int min_val = std::min(left, top);
+    int max_val = std::max(left, top);
+    return jxl::Clamp1(gradient, min_val, max_val);
   };
 
-  auto optimize_multiplier = [&](const float* m, const float* s, float initial,
-                                 float base) {
-    if (cparams.speed_tier > SpeedTier::kSquirrel || fast) {
-      return static_cast<int32_t>(std::round(initial));
+  int pred_x = get_pred(map_x, tx, ty);
+  int pred_b = get_pred(map_b, tx, ty);
+
+  tile_q = num_blocks > 0 ? tile_q / num_blocks : 1.0f;
+
+  auto optimize_channel_simd = [&](const float* m, const float* s, int pred, float base) {
+    int step = 1;
+    if (fast) {
+      step = 8;
+    } else if (cparams.speed_tier >= SpeedTier::kCheetah) {
+      step = 8;
+    } else if (cparams.speed_tier >= SpeedTier::kHare) {
+      step = 4;
+    } else if (cparams.speed_tier >= SpeedTier::kSquirrel) {
+      step = 2;
+    } else {
+      step = 1;
     }
-    int32_t best_m = static_cast<int32_t>(std::round(initial));
-    float best_cost = evaluate_candidate(m, s, best_m, base);
-    int32_t last_cand = best_m;
-    for (int delta : {-2, -1, 1, 2}) {
-      int32_t cand = jxl::Clamp1(best_m + delta, -128, 127);
-      if (cand == last_cand || cand == best_m) continue;
-      last_cand = cand;
-      float cost = evaluate_candidate(m, s, cand, base);
-      if (cost < best_cost) {
-        best_cost = cost;
-        best_m = cand;
+
+    size_t lanes = Lanes(df);
+    
+    // Vectorized correlation and energy analysis
+    auto v_dot_ms = Zero(df);
+    auto v_dot_mm = Zero(df);
+    auto v_dot_ss = Zero(df);
+    auto v_sum_s = Zero(df);
+    for (size_t i = 0; i < num_ac; i += lanes) {
+      const auto m_v = LoadU(df, m + i);
+      const auto s_v = LoadU(df, s + i);
+      const auto w_v = LoadU(df, coeffs_w + i);
+      const auto wm_v = Mul(w_v, m_v);
+      v_dot_ms = MulAdd(wm_v, s_v, v_dot_ms);
+      v_dot_mm = MulAdd(wm_v, m_v, v_dot_mm);
+      v_dot_ss = MulAdd(w_v, Mul(s_v, s_v), v_dot_ss);
+      v_sum_s = Add(v_sum_s, Abs(s_v));
+    }
+    float dot_ms = GetLane(SumOfLanes(df, v_dot_ms));
+    float dot_mm = GetLane(SumOfLanes(df, v_dot_mm));
+    float dot_ss = GetLane(SumOfLanes(df, v_dot_ss));
+    float sum_s = GetLane(SumOfLanes(df, v_sum_s));
+    float energy = num_ac > 0 ? (sum_s / num_ac) : 0.0f;
+
+    // Calculate analytical least-squares optimal target multiplier
+    float target_factor = (dot_mm > 1e-6f) ? (dot_ms / dot_mm) : base;
+    int target_cand = jxl::Clamp1(
+        static_cast<int>(std::round((target_factor - base) * kDefaultColorFactor)),
+        -128, 127);
+    float corr = (dot_mm > 1e-6f && dot_ss > 1e-6f)
+                     ? (std::abs(dot_ms) / std::sqrt(dot_mm * dot_ss))
+                     : 0.0f;
+
+    // Extracted SIMD inner loop that evaluates an array of candidates
+    auto evaluate_simd = [&](const float* eval_cands, float* eval_costs, size_t num_eval) {
+      const auto oversat_penalty = Set(df, kOversatPenaltyFactor);
+      for (size_t i = 0; i < num_ac; ++i) {
+        const auto m_v = Set(df, m[i]);
+        const auto s_v = Set(df, s[i]);
+        const auto w_v = Set(df, coeffs_w[i]);
+        const auto abs_s_v = Abs(s_v);
+        
+        for (size_t c = 0; c < num_eval; c += lanes) {
+          const auto mul_v = LoadU(df, eval_cands + c);
+          const auto factor_v = Add(Set(df, base), Mul(mul_v, Set(df, 1.0f / kDefaultColorFactor)));
+          
+          const auto res_v = Sub(s_v, Mul(factor_v, m_v));
+          const auto abs_res_v = Abs(res_v);
+          auto cost_v = Mul(w_v, abs_res_v);
+          
+          const auto is_oversat = Lt(abs_s_v, abs_res_v);
+          cost_v = IfThenElse(is_oversat, Mul(cost_v, oversat_penalty), cost_v);
+          
+          const auto accum_v = LoadU(df, eval_costs + c);
+          StoreU(Add(accum_v, cost_v), df, eval_costs + c);
+        }
+      }
+    };
+
+    // Coarse Search Setup
+    float* HWY_RESTRICT cands = scratch_space;
+    float* HWY_RESTRICT costs = cands + 256;
+    memset(costs, 0, 256 * sizeof(float));
+
+    int true_num_cands = 0;
+    for (int cand = -128; cand <= 127; cand += step) cands[true_num_cands++] = cand;
+    
+    // Always include analytical target_cand, pred, and 0 in candidate set
+    auto add_special_cand = [&](int cand) {
+      cand = jxl::Clamp1(cand, -128, 127);
+      for (int i = 0; i < true_num_cands; ++i) {
+        if (static_cast<int>(cands[i]) == cand) return;
+      }
+      cands[true_num_cands++] = cand;
+    };
+    add_special_cand(target_cand);
+    add_special_cand(pred);
+    add_special_cand(0);
+
+    int num_cands = true_num_cands;
+    while (num_cands % lanes != 0) { cands[num_cands] = cands[0]; costs[num_cands++] = 0; }
+    
+    // Evaluate Coarse
+    evaluate_simd(cands, costs, num_cands);
+
+    // Calculate DC chroma stats for the tile
+    const float* dc_channel = (base == 0.0f) ? dc_values_x : dc_values_b;
+    float dc_sum = 0.0f;
+    int dc_count = 0;
+    for (size_t y = y0; y < y1; ++y) {
+      for (size_t x = x0; x < x1; ++x) {
+        float val = dc_channel[y * xsize_blocks + x];
+        dc_sum += std::abs(val);
+        dc_count++;
       }
     }
-    return best_m;
+    float dc_avg = dc_count > 0 ? (dc_sum / dc_count) : 0.0f;
+
+    // Multi-factor deadzone refinement:
+    // 1. If luma & chroma are uncorrelated (corr < 0.20) and area is low-energy/neutral (energy < 0.10, dc_avg < 0.25),
+    //    apply a strong deadzone penalty (2.5f) to avoid injecting color noise into neutral edges.
+    // 2. If there is moderate correlation (corr < 0.35) and very low chroma energy, apply mild penalty (1.8f).
+    // 3. If there is solid correlation (corr >= 0.35) OR saturated DC chroma, allow full prediction freedom (1.0f).
+    float deadzone_penalty = 1.0f;
+    if (corr < 0.20f && energy < 0.10f && dc_avg < 0.25f) {
+      deadzone_penalty = 2.5f;
+    } else if (corr < 0.35f && energy < 0.05f && dc_avg < 0.40f) {
+      deadzone_penalty = 1.8f;
+    }
+
+    // Dynamic Lambda setup
+    int best_cand = 0;
+    float best_cost = std::numeric_limits<float>::max();
+    float dynamic_lambda = 0.0004f * tile_q;
+
+    for (int c = 0; c < true_num_cands; ++c) {
+      float cost = costs[c] + dynamic_lambda * std::log2(1.0f + std::abs(cands[c] - pred));
+      cost += std::abs(cands[c]) * kMultiplierBitCost * deadzone_penalty;
+      if (cost < best_cost) { best_cost = cost; best_cand = cands[c]; }
+    }
+
+    // Fine Search Setup & Evaluation
+    if (step > 1) {
+      float* HWY_RESTRICT f_cands = costs + 256;
+      float* HWY_RESTRICT f_costs = f_cands + 256;
+      memset(f_costs, 0, 256 * sizeof(float));
+
+      int true_num_fine = 0;
+      for (int cand = best_cand - step + 1; cand < best_cand + step; ++cand) {
+        if (cand < -128 || cand > 127 || cand == best_cand) continue;
+        f_cands[true_num_fine++] = cand;
+      }
+      // Also ensure fine neighbors around analytical target_cand are evaluated
+      for (int cand = target_cand - 1; cand <= target_cand + 1; ++cand) {
+        if (cand < -128 || cand > 127 || cand == best_cand) continue;
+        bool exists = false;
+        for (int i = 0; i < true_num_fine; ++i) {
+          if (static_cast<int>(f_cands[i]) == cand) {
+            exists = true;
+            break;
+          }
+        }
+        if (!exists) f_cands[true_num_fine++] = cand;
+      }
+      
+      if (true_num_fine > 0) {
+        int num_fine = true_num_fine;
+        while (num_fine % lanes != 0) { f_cands[num_fine] = f_cands[0]; f_costs[num_fine++] = 0; }
+        
+        evaluate_simd(f_cands, f_costs, num_fine);
+        
+        for (int c = 0; c < true_num_fine; ++c) {
+          float cost = f_costs[c] + dynamic_lambda * std::log2(1.0f + std::abs(f_cands[c] - pred));
+          cost += std::abs(f_cands[c]) * kMultiplierBitCost * deadzone_penalty;
+          if (cost < best_cost) { best_cost = cost; best_cand = f_cands[c]; }
+        }
+      }
+    }
+    return best_cand;
   };
 
-  float initial_x = FindBestMultiplier(coeffs_yx, coeffs_x, coeffs_w, num_ac, 0.0f,
-                                       kDistanceMultiplierAC, fast,
-                                       towards_zero_x);
-  row_out_x[tx] = optimize_multiplier(coeffs_yx, coeffs_x, initial_x, 0.0f);
-
-  float initial_b =
-      FindBestMultiplier(coeffs_yb, coeffs_b, coeffs_w, num_ac, jxl::cms::kYToBRatio,
-                         kDistanceMultiplierAC, fast, towards_zero_b);
-  row_out_b[tx] =
-      optimize_multiplier(coeffs_yb, coeffs_b, initial_b, jxl::cms::kYToBRatio);
+  row_out_x[tx] = optimize_channel_simd(coeffs_yx, coeffs_x, pred_x, 0.0f);
+  row_out_b[tx] = optimize_channel_simd(coeffs_yb, coeffs_b, pred_b, jxl::cms::kYToBRatio);
   return true;
 }
 
