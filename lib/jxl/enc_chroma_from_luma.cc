@@ -140,6 +140,8 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   JXL_ENSURE(mem.size() == 2 * AcStrategy::kMaxCoeffArea + dct_scratch_size);
 
   size_t num_ac = 0;
+  float tile_q = 0.0f;
+  int num_blocks = 0;
 
   for (size_t y = y0; y < y1; ++y) {
     const float* JXL_RESTRICT row_y =
@@ -212,10 +214,9 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       // than the previous approach which was also a hack.)
       const float qq =
           (raw_quant_field == nullptr) ? 1.0f : raw_quant_field->Row(y)[x];
-      // Experimentally values 128-130 seem best -- I don't know why we
-      // need this multiplier.
-      const float kStrangeMultiplier = 128;
-      float q = use_dct8 ? 1 : quantizer->Scale() * kStrangeMultiplier * qq;
+      float q = use_dct8 ? 1.0f : (quantizer->Scale() * qq);
+      tile_q += q;
+      num_blocks++;
       const auto qv = Set(df, q);
       size_t sx = cx * 8;
       size_t sy = cy * 8;
@@ -248,37 +249,6 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   constexpr float kOversatPenaltyFactor = 1.2f;
   constexpr float kMultiplierBitCost = 0.1f;
 
-  auto evaluate_candidate = [&](const float* m, const float* s,
-                                float multiplier, float base) {
-    const auto zero = Zero(df);
-    const auto factor = Set(df, base + multiplier / kDefaultColorFactor);
-    const auto oversat_penalty = Set(df, kOversatPenaltyFactor);
-
-    auto total_cost_v = zero;
-
-    for (size_t i = 0; i < num_ac; i += Lanes(df)) {
-      const auto m_v = Load(df, m + i);
-      const auto s_v = Load(df, s + i);
-      const auto w_v = Load(df, coeffs_w + i);
-
-      const auto res_v = Sub(s_v, Mul(factor, m_v));
-      const auto abs_res_v = Abs(res_v);
-      auto cost_v = Mul(w_v, abs_res_v);
-
-      // Psycho-visual RDO heuristic: Oversaturation Penalty
-      // If the CfL prediction adds energy (making the residual larger than the 
-      // original coefficient), it means we are injecting false colors or overshooting.
-      const auto abs_s_v = Abs(s_v);
-      const auto is_oversat = Lt(abs_s_v, abs_res_v);
-      cost_v = IfThenElse(is_oversat, Mul(cost_v, oversat_penalty), cost_v);
-
-      total_cost_v = Add(total_cost_v, cost_v);
-    }
-    float total_cost = GetLane(SumOfLanes(df, total_cost_v));
-    total_cost += std::abs(multiplier) * kMultiplierBitCost;
-    return total_cost;
-  };
-
   auto get_pred = [](const ImageSB* map, int tx, int ty) {
     if (tx == 0 && ty == 0) return 0;
     if (tx == 0) return (int)map->Row(ty - 1)[tx];
@@ -295,52 +265,97 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   int pred_x = get_pred(map_x, tx, ty);
   int pred_b = get_pred(map_b, tx, ty);
 
-  int step = 1;
-  if (fast) {
-    step = 8;
-  } else if (cparams.speed_tier >= SpeedTier::kWombat) {  // Effort 5 and 6
-    step = 8;
-  } else if (cparams.speed_tier >= SpeedTier::kSquirrel) {  // Effort 7
-    step = 4;
-  }
+  tile_q = num_blocks > 0 ? tile_q / num_blocks : 1.0f;
 
-  constexpr float lambda_bits = 0.05f;
+  auto optimize_channel_simd = [&](const float* m, const float* s, int pred, float base) {
+    int step = 1;
+    if (fast) step = 8;
+    else if (cparams.speed_tier >= SpeedTier::kWombat) step = 8;
+    else if (cparams.speed_tier >= SpeedTier::kSquirrel) step = 4;
 
-  auto optimize_channel = [&](const float* coeffs_m, const float* coeffs_s,
-                              int pred, float base) {
+    size_t lanes = Lanes(df);
+    
+    // Extracted SIMD inner loop that evaluates an array of candidates
+    auto evaluate_simd = [&](const float* eval_cands, float* eval_costs, size_t num_eval) {
+      const auto oversat_penalty = Set(df, kOversatPenaltyFactor);
+      for (size_t i = 0; i < num_ac; ++i) {
+        const auto m_v = Set(df, m[i]);
+        const auto s_v = Set(df, s[i]);
+        const auto w_v = Set(df, coeffs_w[i]);
+        const auto abs_s_v = Abs(s_v);
+        
+        for (size_t c = 0; c < num_eval; c += lanes) {
+          const auto mul_v = LoadU(df, eval_cands + c);
+          const auto factor_v = Add(Set(df, base), Mul(mul_v, Set(df, 1.0f / kDefaultColorFactor)));
+          
+          const auto res_v = Sub(s_v, Mul(factor_v, m_v));
+          const auto abs_res_v = Abs(res_v);
+          auto cost_v = Mul(w_v, abs_res_v);
+          
+          const auto is_oversat = Lt(abs_s_v, abs_res_v);
+          cost_v = IfThenElse(is_oversat, Mul(cost_v, oversat_penalty), cost_v);
+          
+          const auto accum_v = LoadU(df, eval_costs + c);
+          StoreU(Add(accum_v, cost_v), df, eval_costs + c);
+        }
+      }
+    };
+
+    // Coarse Search Setup
+    float* HWY_RESTRICT cands = scratch_space;
+    float* HWY_RESTRICT costs = cands + 256;
+    memset(costs, 0, 256 * sizeof(float));
+
+    int true_num_cands = 0;
+    for (int cand = -128; cand <= 127; cand += step) cands[true_num_cands++] = cand;
+    
+    int num_cands = true_num_cands;
+    while (num_cands % lanes != 0) { cands[num_cands] = cands[0]; costs[num_cands++] = 0; }
+    
+    // Evaluate Coarse
+    evaluate_simd(cands, costs, num_cands);
+
+    // Dynamic Lambda setup
     int best_cand = 0;
     float best_cost = std::numeric_limits<float>::max();
+    float dynamic_lambda = 0.0004f * tile_q;
 
-    // Coarse search
-    for (int cand = -128; cand <= 127; cand += step) {
-      float cost = evaluate_candidate(coeffs_m, coeffs_s, cand, base);
-      cost += lambda_bits * std::log2(1.0f + std::abs(cand - pred));
-      if (cost < best_cost) {
-        best_cost = cost;
-        best_cand = cand;
-      }
+    for (int c = 0; c < true_num_cands; ++c) {
+      float cost = costs[c] + dynamic_lambda * std::log2(1.0f + std::abs(cands[c] - pred));
+      cost += std::abs(cands[c]) * kMultiplierBitCost;
+      if (cost < best_cost) { best_cost = cost; best_cand = cands[c]; }
     }
 
-    // Fine search
+    // Fine Search Setup & Evaluation
     if (step > 1) {
-      int coarse_best = best_cand;
-      for (int cand = coarse_best - step + 1; cand < coarse_best + step;
-           ++cand) {
-        if (cand < -128 || cand > 127 || cand == coarse_best) continue;
-        float cost = evaluate_candidate(coeffs_m, coeffs_s, cand, base);
-        cost += lambda_bits * std::log2(1.0f + std::abs(cand - pred));
-        if (cost < best_cost) {
-          best_cost = cost;
-          best_cand = cand;
+      float* HWY_RESTRICT f_cands = costs + 256;
+      float* HWY_RESTRICT f_costs = f_cands + 256;
+      memset(f_costs, 0, 256 * sizeof(float));
+
+      int true_num_fine = 0;
+      for (int cand = best_cand - step + 1; cand < best_cand + step; ++cand) {
+        if (cand < -128 || cand > 127 || cand == best_cand) continue;
+        f_cands[true_num_fine++] = cand;
+      }
+      
+      if (true_num_fine > 0) {
+        int num_fine = true_num_fine;
+        while (num_fine % lanes != 0) { f_cands[num_fine] = f_cands[0]; f_costs[num_fine++] = 0; }
+        
+        evaluate_simd(f_cands, f_costs, num_fine);
+        
+        for (int c = 0; c < true_num_fine; ++c) {
+          float cost = f_costs[c] + dynamic_lambda * std::log2(1.0f + std::abs(f_cands[c] - pred));
+          cost += std::abs(f_cands[c]) * kMultiplierBitCost;
+          if (cost < best_cost) { best_cost = cost; best_cand = f_cands[c]; }
         }
       }
     }
     return best_cand;
   };
 
-  row_out_x[tx] = optimize_channel(coeffs_yx, coeffs_x, pred_x, 0.0f);
-  row_out_b[tx] =
-      optimize_channel(coeffs_yb, coeffs_b, pred_b, jxl::cms::kYToBRatio);
+  row_out_x[tx] = optimize_channel_simd(coeffs_yx, coeffs_x, pred_x, 0.0f);
+  row_out_b[tx] = optimize_channel_simd(coeffs_yb, coeffs_b, pred_b, jxl::cms::kYToBRatio);
   return true;
 }
 
