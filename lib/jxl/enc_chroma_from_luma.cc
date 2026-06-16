@@ -53,26 +53,21 @@ using hwy::HWY_NAMESPACE::Lt;
 static HWY_FULL(float) df;
 struct WeightProfile {
   float w[64];
-  float b_weight[64];
   WeightProfile() {
     float max_r = std::sqrt(7.0f * 7.0f + 7.0f * 7.0f);
     for (int y = 0; y < 8; ++y) {
       for (int x = 0; x < 8; ++x) {
         if (x == 0 && y == 0) {
           w[0] = 0.0f;
-          b_weight[0] = 1.0f;
         } else {
           float r = std::sqrt(static_cast<float>(x * x + y * y));
           w[y * 8 + x] = 1.0f + 2.0f * (1.0f - r / max_r);
-          b_weight[y * 8 + x] = 1.0f - 0.5f * (r / max_r);
         }
       }
     }
   }
 };
 static const WeightProfile kWeightProfile;
-
-
 
 Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,
                      ImageF* dc_values) {
@@ -134,8 +129,7 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   float* HWY_RESTRICT coeffs_yb = coeffs_x + kColorTileDim * kColorTileDim;
   float* HWY_RESTRICT coeffs_b = coeffs_yb + kColorTileDim * kColorTileDim;
   float* HWY_RESTRICT coeffs_w = coeffs_b + kColorTileDim * kColorTileDim;
-  float* HWY_RESTRICT coeffs_w_b = coeffs_w + kColorTileDim * kColorTileDim;
-  JXL_ENSURE(mem.remove_prefix(6 * kColorTileDim * kColorTileDim));
+  JXL_ENSURE(mem.remove_prefix(5 * kColorTileDim * kColorTileDim));
   constexpr size_t dc_size =
       AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks;
   float* HWY_RESTRICT dc_y = mem.begin();
@@ -231,11 +225,11 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
         size_t iy_norm = iy >> shift_y;
         for (size_t ix = 0; ix < sx; ++ix) {
           size_t ix_norm = ix >> shift_x;
-          coeffs_w[num_ac + iy * sx + ix] = kWeightProfile.w[iy_norm * 8 + ix_norm];
-          coeffs_w_b[num_ac + iy * sx + ix] = kWeightProfile.b_weight[iy_norm * 8 + ix_norm];
+          coeffs_w[num_ac + iy * sx + ix] =
+              kWeightProfile.w[iy_norm * 8 + ix_norm];
         }
       }
-      
+
       for (size_t i = 0; i < cx * cy * 64; i += Lanes(df)) {
         const auto b_y = Load(df, block_y + i);
         const auto b_x = Load(df, block_x + i);
@@ -255,11 +249,10 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   constexpr float kMultiplierBitCost = 0.1f;
 
   auto evaluate_candidate = [&](const float* m, const float* s,
-                                float multiplier, float base, bool is_b) {
+                                float multiplier, float base) {
     const auto zero = Zero(df);
     const auto factor = Set(df, base + multiplier / kDefaultColorFactor);
     const auto oversat_penalty = Set(df, kOversatPenaltyFactor);
-    const auto mul_v = Set(df, multiplier);
 
     auto total_cost_v = zero;
 
@@ -267,19 +260,16 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       const auto m_v = Load(df, m + i);
       const auto s_v = Load(df, s + i);
       const auto w_v = Load(df, coeffs_w + i);
-      const auto b_w_v = is_b ? Load(df, coeffs_w_b + i) : Set(df, 1.0f);
 
       const auto res_v = Sub(s_v, Mul(factor, m_v));
       const auto abs_res_v = Abs(res_v);
-      auto cost_v = Mul(Mul(w_v, b_w_v), abs_res_v);
+      auto cost_v = Mul(w_v, abs_res_v);
 
       // Psycho-visual RDO heuristic: Oversaturation Penalty
-      // If the multiplier causes the predicted chroma to overshoot the original
-      // chroma such that the residual (C_orig - C) has the opposite sign of the
-      // applied correlation, it means we are artificially boosting colors.
-      // Oversaturated artifacts are visually jarring, so penalizing them
-      // significantly improves perceptual metrics (SSIMULACRA2, Butteraugli).
-      const auto is_oversat = Lt(Mul(mul_v, res_v), zero);
+      // If the CfL prediction adds energy (making the residual larger than the 
+      // original coefficient), it means we are injecting false colors or overshooting.
+      const auto abs_s_v = Abs(s_v);
+      const auto is_oversat = Lt(abs_s_v, abs_res_v);
       cost_v = IfThenElse(is_oversat, Mul(cost_v, oversat_penalty), cost_v);
 
       total_cost_v = Add(total_cost_v, cost_v);
@@ -305,114 +295,52 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   int pred_x = get_pred(map_x, tx, ty);
   int pred_b = get_pred(map_b, tx, ty);
 
-  struct Candidate {
-    int cand;
-    float cost;
-    bool operator<(const Candidate& other) const { return cost < other.cost; }
-  };
-  Candidate best_x_cands[256];
-  Candidate best_b_cands[256];
-  size_t num_x_cands = 0;
-  size_t num_b_cands = 0;
-
-  int step = (cparams.speed_tier > SpeedTier::kSquirrel || fast) ? 4 : 1;
-
-  for (int cand = -128; cand <= 127; cand += step) {
-    float cost_x = evaluate_candidate(coeffs_yx, coeffs_x, cand, 0.0f, false);
-    best_x_cands[num_x_cands++] = {cand, cost_x};
-    float cost_b = evaluate_candidate(coeffs_yb, coeffs_b, cand, jxl::cms::kYToBRatio, true);
-    best_b_cands[num_b_cands++] = {cand, cost_b};
+  int step = 1;
+  if (fast) {
+    step = 8;
+  } else if (cparams.speed_tier >= SpeedTier::kWombat) {  // Effort 5 and 6
+    step = 8;
+  } else if (cparams.speed_tier >= SpeedTier::kSquirrel) {  // Effort 7
+    step = 4;
   }
-
-  std::sort(best_x_cands, best_x_cands + num_x_cands);
-  std::sort(best_b_cands, best_b_cands + num_b_cands);
-
-  int top_n = std::min<int>(4, num_x_cands);
-  
-  if (step > 1) {
-    int best_coarse_x = best_x_cands[0].cand;
-    int best_coarse_b = best_b_cands[0].cand;
-    for (int cand = best_coarse_x - step + 1; cand < best_coarse_x + step; ++cand) {
-       if (cand < -128 || cand > 127 || cand == best_coarse_x) continue;
-       best_x_cands[num_x_cands++] = {cand, evaluate_candidate(coeffs_yx, coeffs_x, cand, 0.0f, false)};
-    }
-    for (int cand = best_coarse_b - step + 1; cand < best_coarse_b + step; ++cand) {
-       if (cand < -128 || cand > 127 || cand == best_coarse_b) continue;
-       best_b_cands[num_b_cands++] = {cand, evaluate_candidate(coeffs_yb, coeffs_b, cand, jxl::cms::kYToBRatio, true)};
-    }
-    std::sort(best_x_cands, best_x_cands + num_x_cands);
-    std::sort(best_b_cands, best_b_cands + num_b_cands);
-  }
-
-  auto evaluate_joint_candidate = [&](float mult_x, float mult_b) {
-    const auto zero = Zero(df);
-    const auto factor_x = Set(df, mult_x / kDefaultColorFactor);
-    const auto factor_b = Set(df, jxl::cms::kYToBRatio + mult_b / kDefaultColorFactor);
-    const auto oversat_penalty = Set(df, kOversatPenaltyFactor);
-    const auto mul_v_x = Set(df, mult_x);
-    const auto mul_v_b = Set(df, mult_b);
-
-    auto total_cost_v = zero;
-
-    for (size_t i = 0; i < num_ac; i += Lanes(df)) {
-      const auto m_v_x = Load(df, coeffs_yx + i);
-      const auto s_v_x = Load(df, coeffs_x + i);
-      const auto m_v_b = Load(df, coeffs_yb + i);
-      const auto s_v_b = Load(df, coeffs_b + i);
-      const auto w_v = Load(df, coeffs_w + i);
-      const auto b_w_v = Load(df, coeffs_w_b + i);
-
-      const auto res_v_x = Sub(s_v_x, Mul(factor_x, m_v_x));
-      const auto abs_res_v_x = Abs(res_v_x);
-      
-      const auto res_v_b = Sub(s_v_b, Mul(factor_b, m_v_b));
-      const auto abs_res_v_b = Mul(b_w_v, Abs(res_v_b));
-
-      // Fast L2 approximation: max + 0.4 * min
-      const auto max_res = Max(abs_res_v_x, abs_res_v_b);
-      const auto min_res = Min(abs_res_v_x, abs_res_v_b);
-      auto cost_v = Mul(w_v, Add(max_res, Mul(Set(df, 0.4f), min_res)));
-
-      const auto is_oversat_x = Lt(Mul(mul_v_x, res_v_x), zero);
-      cost_v = IfThenElse(is_oversat_x, Mul(cost_v, oversat_penalty), cost_v);
-      
-      const auto is_oversat_b = Lt(Mul(mul_v_b, res_v_b), zero);
-      cost_v = IfThenElse(is_oversat_b, Mul(cost_v, oversat_penalty), cost_v);
-
-      total_cost_v = Add(total_cost_v, cost_v);
-    }
-    return GetLane(SumOfLanes(df, total_cost_v));
-  };
-
-  int32_t best_x = 0;
-  int32_t best_b = 0;
-  float best_joint_cost = std::numeric_limits<float>::max();
 
   constexpr float lambda_bits = 0.05f;
 
-  for (int i = 0; i < top_n; ++i) {
-    for (int j = 0; j < top_n; ++j) {
-      int cand_x = best_x_cands[i].cand;
-      int cand_b = best_b_cands[j].cand;
+  auto optimize_channel = [&](const float* coeffs_m, const float* coeffs_s,
+                              int pred, float base) {
+    int best_cand = 0;
+    float best_cost = std::numeric_limits<float>::max();
 
-      float joint_cost = evaluate_joint_candidate(cand_x, cand_b);
-      
-      float bit_cost_x = lambda_bits * std::log2(1.0f + std::abs(cand_x - pred_x));
-      float bit_cost_b = lambda_bits * std::log2(1.0f + std::abs(cand_b - pred_b));
-      
-      float total_cost = joint_cost + bit_cost_x + bit_cost_b + 
-                         (std::abs(cand_x) + std::abs(cand_b)) * kMultiplierBitCost;
-
-      if (total_cost < best_joint_cost) {
-        best_joint_cost = total_cost;
-        best_x = cand_x;
-        best_b = cand_b;
+    // Coarse search
+    for (int cand = -128; cand <= 127; cand += step) {
+      float cost = evaluate_candidate(coeffs_m, coeffs_s, cand, base);
+      cost += lambda_bits * std::log2(1.0f + std::abs(cand - pred));
+      if (cost < best_cost) {
+        best_cost = cost;
+        best_cand = cand;
       }
     }
-  }
 
-  row_out_x[tx] = best_x;
-  row_out_b[tx] = best_b;
+    // Fine search
+    if (step > 1) {
+      int coarse_best = best_cand;
+      for (int cand = coarse_best - step + 1; cand < coarse_best + step;
+           ++cand) {
+        if (cand < -128 || cand > 127 || cand == coarse_best) continue;
+        float cost = evaluate_candidate(coeffs_m, coeffs_s, cand, base);
+        cost += lambda_bits * std::log2(1.0f + std::abs(cand - pred));
+        if (cost < best_cost) {
+          best_cost = cost;
+          best_cand = cand;
+        }
+      }
+    }
+    return best_cand;
+  };
+
+  row_out_x[tx] = optimize_channel(coeffs_yx, coeffs_x, pred_x, 0.0f);
+  row_out_b[tx] =
+      optimize_channel(coeffs_yb, coeffs_b, pred_b, jxl::cms::kYToBRatio);
   return true;
 }
 
