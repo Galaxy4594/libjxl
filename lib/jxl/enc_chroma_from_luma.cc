@@ -315,6 +315,16 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
     // Evaluate Coarse
     evaluate_simd(cands, costs, num_cands);
 
+    // Emulate Adaptive Deadzone (commit 6d5e5c42): 
+    // Calculate AC energy to dynamically adjust the L1 multiplier penalty.
+    float energy = 0.0f;
+    for (size_t i = 0; i < num_ac; ++i) energy += std::abs(s[i]);
+    energy = num_ac > 0 ? energy / num_ac : 0.0f;
+    
+    // If energy is low (near neutral), heavily penalize non-zero multipliers
+    // to avoid color noise. If energy is high, lower the penalty to preserve chroma.
+    float deadzone_penalty = (energy > 0.1f) ? 1.0f : 2.5f;
+
     // Dynamic Lambda setup
     int best_cand = 0;
     float best_cost = std::numeric_limits<float>::max();
@@ -322,7 +332,7 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
 
     for (int c = 0; c < true_num_cands; ++c) {
       float cost = costs[c] + dynamic_lambda * std::log2(1.0f + std::abs(cands[c] - pred));
-      cost += std::abs(cands[c]) * kMultiplierBitCost;
+      cost += std::abs(cands[c]) * kMultiplierBitCost * deadzone_penalty;
       if (cost < best_cost) { best_cost = cost; best_cand = cands[c]; }
     }
 
@@ -346,7 +356,7 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
         
         for (int c = 0; c < true_num_fine; ++c) {
           float cost = f_costs[c] + dynamic_lambda * std::log2(1.0f + std::abs(f_cands[c] - pred));
-          cost += std::abs(f_cands[c]) * kMultiplierBitCost;
+          cost += std::abs(f_cands[c]) * kMultiplierBitCost * deadzone_penalty;
           if (cost < best_cost) { best_cost = cost; best_cand = f_cands[c]; }
         }
       }
