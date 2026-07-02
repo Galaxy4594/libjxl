@@ -381,7 +381,7 @@ class JxlCodec : public ImageCodec {
     if (encoded.bitstreams.empty()) {
       return JXL_FAILURE("Internal logic error");
     }
-    std::string fn = JoinPath(ticket->debug_prefix, std::string(label) + ".png");
+    std::string fn = JoinPath(ticket->debug_prefix, SanitizeFileName(std::string(label)) + ".png");
     WriteFile(fn, encoded.bitstreams[0]);
     return true;
   }
@@ -389,9 +389,10 @@ class JxlCodec : public ImageCodec {
   Status SetDebugImageCallback(const std::string& filename, DebugTicket* ticket,
                                JXLCompressParams* cparams) {
     if (jxlargs->debug_image_dir.empty()) return true;
+    std::string safe_params = SanitizeFileName(params_);
     ticket->debug_prefix =
         JoinPath(jxlargs->debug_image_dir, FileBaseName(filename)) +
-        ".jxl-" + params_ + ".dbg";
+        ".jxl-" + safe_params + ".dbg";
     JXL_RETURN_IF_ERROR(MakeDir(ticket->debug_prefix));
     cparams->debug_image_opaque = ticket;
     cparams->debug_image = &DebugCallback;

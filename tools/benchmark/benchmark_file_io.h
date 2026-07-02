@@ -45,6 +45,9 @@ std::string FileDirName(const std::string& fname);
 // string if there is no dot.
 std::string FileExtension(const std::string& fname);
 
+// Replaces forbidden characters (< > : " / \ | ? *) with '_' for OS-agnostic paths.
+std::string SanitizeFileName(const std::string& fname);
+
 // Matches one or more files given glob pattern.
 Status MatchFiles(const std::string& pattern, std::vector<std::string>* list);
 

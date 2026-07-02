@@ -124,6 +124,17 @@ std::string FileExtension(const std::string& fname) {
   return fname.substr(pos);
 }
 
+std::string SanitizeFileName(const std::string& fname) {
+  std::string sanitized = fname;
+  const char* forbidden = "<>:\"/\\|?*";
+  for (char& c : sanitized) {
+    if (std::strchr(forbidden, c) != nullptr) {
+      c = '_';
+    }
+  }
+  return sanitized;
+}
+
 std::string JoinPath(const std::string& first, const std::string& second) {
   bool first_has_separator = !first.empty() && (first.back() == kPathSeparator);
   bool second_has_separator = !second.empty() && (second[0] == kPathSeparator);

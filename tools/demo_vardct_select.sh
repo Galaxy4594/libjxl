@@ -75,10 +75,10 @@ EOF
     convert $tmp/orig \( $tmp/orig.jxl-d$i.dbg/ac_strategy.png \
       -alpha set -channel A -evaluate set 66% \) \
       -composite $tmp/t.ppm
-    bytes=$(stat -c "%s" $tmp/orig.jxl_d$i)
+    bytes=$(wc -c < "$tmp/orig.d$i.jxl" | tr -d ' ')
     bpp=$( echo "$bytes * 8 / $pixels " | bc -l | cut -b 1-6 )
     label="cjxl -d $i  ($((bytes / 1000)) kb, bpp: $bpp)"
-    convert +append $tmp/t.ppm $tmp/orig.jxl_d$i.png $tmp/t2.ppm
+    convert +append $tmp/t.ppm "$tmp/orig.d$i.jxl.png" $tmp/t2.ppm
     convert $tmp/t2.ppm \
           -gravity north \
           -pointsize 32 \

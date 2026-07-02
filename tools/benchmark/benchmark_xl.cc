@@ -312,9 +312,9 @@ Status DoCompress(const std::string& filename, const PackedPixelFile& ppf,
   if (Args()->save_compressed || Args()->save_decompressed) {
     std::string dir = FileDirName(filename);
     std::string outdir =
-        Args()->output_dir.empty() ? dir + "/out" : Args()->output_dir;
+        Args()->output_dir.empty() ? JoinPath(dir, "out") : Args()->output_dir;
     std::string compressed_fn =
-        outdir + "/" + name + CodecToExtension(codec_name, ':');
+        JoinPath(outdir, SanitizeFileName(name + CodecToExtension(codec_name, ':')));
     std::string decompressed_fn = compressed_fn + Args()->output_extension;
     std::string heatmap_fn;
     if (jxl::extras::GetAPNGEncoder()) {
@@ -531,24 +531,21 @@ Status WriteHtmlReport(const std::string& codec_desc,
   std::string outdir;
   out_html.append("<body bgcolor=\"#000\">\n");
   out_html.append("<style>img { image-rendering: pixelated; }</style>\n");
-  std::string codec_name = codec_desc;
-  // Make compatible for filename
-  std::replace(codec_name.begin(), codec_name.end(), ':', '_');
+  std::string codec_name = SanitizeFileName(codec_desc);
   for (size_t i = 0; i < fnames.size(); ++i) {
     std::string name = FileBaseName(fnames[i]);
     std::string dir = FileDirName(fnames[i]);
-    outdir = Args()->output_dir.empty() ? dir + "/out" : Args()->output_dir;
-    std::string name_out = name + CodecToExtension(codec_name, '_');
+    outdir = Args()->output_dir.empty() ? JoinPath(dir, "out") : Args()->output_dir;
+    std::string name_out = SanitizeFileName(name + CodecToExtension(codec_name, '_'));
     if (Args()->html_report_use_decompressed) {
       name_out += Args()->output_extension;
     }
     std::string heatmap_out =
-        name + CodecToExtension(codec_name, '_') + ".heatmap.png";
+        SanitizeFileName(name + CodecToExtension(codec_name, '_') + ".heatmap.png");
 
     const std::string& fname_orig = fnames[i];
-    std::string fname_out = std::string(outdir).append("/").append(name_out);
-    std::string fname_heatmap =
-        std::string(outdir).append("/").append(heatmap_out);
+    std::string fname_out = JoinPath(outdir, name_out);
+    std::string fname_heatmap = JoinPath(outdir, heatmap_out);
     std::string url_orig = Args()->originals_url.empty()
                                ? ("file://" + fnames[i])
                                : (Args()->originals_url + "/" + name);
@@ -604,7 +601,7 @@ Status WriteHtmlReport(const std::string& codec_desc,
   }
   out_html.append("</body>\n").append(toggle_js);
   std::string fname_index =
-      std::string(outdir).append("/index.").append(codec_name).append(".html");
+      JoinPath(outdir, "index." + codec_name + ".html");
   JXL_RETURN_IF_ERROR(WriteFile(fname_index, out_html));
   return true;
 }
