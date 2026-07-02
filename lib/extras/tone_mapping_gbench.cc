@@ -8,10 +8,11 @@
 #include <utility>
 
 #include "benchmark/benchmark.h"
+#include "lib/extras/codec_in_out.h"
 #include "lib/extras/tone_mapping.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/cms/color_encoding_cms.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/image.h"
 #include "lib/jxl/image_ops.h"

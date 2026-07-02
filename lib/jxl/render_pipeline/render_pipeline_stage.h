@@ -16,13 +16,15 @@
 
 namespace jxl {
 
+class FrameDecoder;
+
 // The first pixel in the input to RenderPipelineStage will be located at
 // this position. Pixels before this position may be accessed as padding.
 // This should be at least the RoundUpTo(maximum padding / 2, maximum vector
 // size) times 2: this is realized when using Gaborish + EPF + upsampling +
 // chroma subsampling.
 #if JXL_ARCH_ARM
-constexpr size_t kRenderPipelineXOffset = 16;
+constexpr size_t kRenderPipelineXOffset = 24;
 #else
 constexpr size_t kRenderPipelineXOffset = 32;
 #endif
@@ -43,6 +45,40 @@ enum class RenderPipelineChannelMode {
 
 class RenderPipeline;
 
+/*
+   RenderPipelineStage implementations
+
+  +---------------------------------+---+---+---+---+-------------------------+
+  | class                           | b | b | x | y | mode                    |
+  |                                 | x | y | s | s |                         |
+  +---------------------------------+---+---+---+---+-------------------------|
+  | UpsamplingStage                 | 2 | 2 | N | N | InOut, Ignored          |
+  | HorizontalChromaUpsamplingStage | 1 | 0 | 1 | 0 | InOut, Ignored          |
+  | VerticalChromaUpsamplingStage   | 0 | 1 | 0 | 1 | InOut, Ignored          |
+  | UpsampleXSlowStage (test)       | 1 | 0 | 1 | 0 | InOut                   |
+  | UpsampleYSlowStage (test)       | 0 | 1 | 0 | 1 | InOut                   |
+  | EPF0Stage                       | 3 | 3 | 0 | 0 | InOut, Ignored          |
+  | EPF1Stage                       | 2 | 2 | 0 | 0 | InOut, Ignored          |
+  | EPF2Stage                       | 1 | 1 | 0 | 0 | InOut, Ignored          |
+  | ConvolveNoiseStage              | 2 | 2 | 0 | 0 | InOut, Ignored          |
+  | GaborishStage                   | 1 | 1 | 0 | 0 | InOut, Ignored          |
+  | BlendingStage                   | 0 | 0 | 0 | 0 | InPlace                 |
+  | CmsStage                        | 0 | 0 | 0 | 0 | InPlace, Ignored        |
+  | FromLinearStage                 | 0 | 0 | 0 | 0 | InPlace, Ignored        |
+  | AddNoiseStage                   | 0 | 0 | 0 | 0 | Input, InPlace, Ignored |
+  | PatchDictionaryStage            | 0 | 0 | 0 | 0 | InPlace, Ignored        |
+  | SplineStage                     | 0 | 0 | 0 | 0 | InPlace, Ignored        |
+  | SpotColorStage                  | 0 | 0 | 0 | 0 | InPlace, Input, Ignored |
+  | ToLinearStage                   | 0 | 0 | 0 | 0 | InPlace, Ignored        |
+  | ToneMappingStage                | 0 | 0 | 0 | 0 | InPlace, Ignored        |
+  | WriteToOutputStage              | 0 | 0 | 0 | 0 | Input, Ignored          |
+  | WriteToImageBundleStage         | 0 | 0 | 0 | 0 | Input                   |
+  | WriteToImage3FStage             | 0 | 0 | 0 | 0 | Input, Ignored          |
+  | XYBStage                        | 0 | 0 | 0 | 0 | InPlace, Ignored        |
+  | kYCbCrStage                     | 0 | 0 | 0 | 0 | InPlace, Ignored        |
+  | Check0FinalStage (test)         | 0 | 0 | 0 | 0 | Input                   |
+  +---------------------------------+---+---+---+---+-------------------------+
+*/
 class RenderPipelineStage {
  protected:
   using Row = float*;
@@ -83,7 +119,7 @@ class RenderPipelineStage {
     }
 
     static Settings SymmetricBorderOnly(size_t border) {
-      return Symmetric(0, border);
+      return Symmetric(/*shift=*/0, border);
     }
   };
 
@@ -103,9 +139,9 @@ class RenderPipelineStage {
   // nonzero, `temp` will point to an HWY-aligned buffer of at least that number
   // of floats; concurrent calls will have different buffers.
   virtual Status ProcessRow(const RowInfo& input_rows,
-                            const RowInfo& output_rows, size_t xextra,
-                            size_t xsize, size_t xpos, size_t ypos,
-                            size_t thread_id) const = 0;
+                            const RowInfo& output_rows, size_t xextra_left,
+                            size_t xextra_right, size_t xsize, size_t xpos,
+                            size_t ypos, size_t thread_id) const = 0;
 
   // How each channel will be processed. Channels are numbered starting from
   // color channels (always 3) and followed by all other channels.
@@ -168,6 +204,7 @@ class RenderPipelineStage {
   friend class RenderPipeline;
   friend class SimpleRenderPipeline;
   friend class LowMemoryRenderPipeline;
+  friend FrameDecoder; // for PrepareStorage invoking PrepareForThreads
 };
 
 }  // namespace jxl

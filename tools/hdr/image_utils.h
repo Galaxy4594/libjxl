@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "lib/extras/codec_in_out.h"
 #include "lib/extras/dec/decode.h"  // Codec enum
 #include "lib/extras/enc/apng.h"
 #include "lib/extras/enc/encode.h"
@@ -29,7 +30,6 @@
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/codec_in_out.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/image_bundle.h"
 
@@ -81,8 +81,6 @@ static inline jxl::Status Encode(const jxl::CodecInOut& io,
       format.data_type = JXL_TYPE_UINT8;
       encoder = jxl::extras::GetJPEGEncoder();
       if (encoder) {
-        os << io.jpeg_quality;
-        encoder->SetOption("q", os.str());
         break;
       } else {
         return JXL_FAILURE("JPEG XL was built without JPEG support");

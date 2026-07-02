@@ -24,7 +24,8 @@
 #include <string>
 #include <vector>
 
-#include "lib/extras/dec/decode.h"  // for TEST_LIBJPEG_SUPPORT
+#include "lib/extras/codec_in_out.h"
+#include "lib/extras/dec/decode.h"  // IWYU pragma: keep TEST_LIBJPEG_SUPPORT
 #include "lib/extras/dec/jxl.h"
 #include "lib/extras/enc/jxl.h"
 #include "lib/extras/packed_image.h"
@@ -34,12 +35,14 @@
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/butteraugli/butteraugli.h"
-#include "lib/jxl/codec_in_out.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/dec_bit_reader.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/image.h"
 #include "lib/jxl/image_bundle.h"
+#include "lib/jxl/jpeg/jpeg_data.h"
+
+#define Check(OK) ::jxl::test::CheckImpl((OK), #OK, __FILE__, __LINE__)
 
 // TODO(eustas): rewrite
 #define TEST_LIBJPEG_SUPPORT()                                              \
@@ -60,7 +63,8 @@ class ThreadPool;
 
 namespace test {
 
-void Check(bool ok);
+// Don't use this directly!
+void CheckImpl(bool ok, const char* condition, const char* file, int line);
 
 #define JXL_TEST_ASSIGN_OR_DIE(lhs, statusor) \
   PRIVATE_JXL_TEST_ASSIGN_OR_DIE_IMPL(        \
@@ -69,7 +73,7 @@ void Check(bool ok);
 // NOLINTBEGIN(bugprone-macro-parentheses)
 #define PRIVATE_JXL_TEST_ASSIGN_OR_DIE_IMPL(name, lhs, statusor) \
   auto name = statusor;                                          \
-  ::jxl::test::Check(name.ok());                                 \
+  Check(name.ok());                                              \
   lhs = std::move(name).value_();
 // NOLINTEND(bugprone-macro-parentheses)
 
@@ -111,7 +115,8 @@ bool Roundtrip(CodecInOut* io, const CompressParams& cparams,
 size_t Roundtrip(const extras::PackedPixelFile& ppf_in,
                  const extras::JXLCompressParams& cparams,
                  const extras::JXLDecompressParams& dparams, ThreadPool* pool,
-                 extras::PackedPixelFile* ppf_out);
+                 extras::PackedPixelFile* ppf_out,
+                 size_t* decoded_size = nullptr);
 
 // A POD descriptor of a ColorEncoding. Only used in tests as the return value
 // of AllEncodings().
@@ -242,6 +247,9 @@ Status EncodeFile(const CompressParams& params, CodecInOut* io,
                   std::vector<uint8_t>* compressed, ThreadPool* pool = nullptr);
 
 constexpr const char* BoolToCStr(bool b) { return b ? "true" : "false"; }
+
+Status JpegDataToCodecInOut(std::unique_ptr<jxl::jpeg::JPEGData>&& data,
+                            CodecInOut* io);
 
 }  // namespace test
 

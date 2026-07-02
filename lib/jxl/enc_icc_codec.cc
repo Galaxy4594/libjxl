@@ -464,23 +464,20 @@ Status WriteICC(const Span<const uint8_t> icc, BitWriter* JXL_RESTRICT writer,
   }));
 
   for (size_t i = 0; i < enc.size(); i++) {
-    tokens[0].emplace_back(
-        ICCANSContext(i, i > 0 ? enc[i - 1] : 0, i > 1 ? enc[i - 2] : 0),
-        enc[i]);
+    uint32_t ctx = static_cast<uint32_t>(
+        ICCANSContext(i, i > 0 ? enc[i - 1] : 0, i > 1 ? enc[i - 2] : 0));
+    tokens[0].emplace_back(ctx, enc[i]);
   }
   HistogramParams params;
-  params.lz77_method = enc.size() < 4096 ? HistogramParams::LZ77Method::kOptimal
+  params.lz77_method = enc.size() < 16384 ? HistogramParams::LZ77Method::kOptimal
                                          : HistogramParams::LZ77Method::kLZ77;
   EntropyEncodingData code;
-  std::vector<uint8_t> context_map;
   params.force_huffman = true;
-  JXL_ASSIGN_OR_RETURN(
-      size_t cost,
-      BuildAndEncodeHistograms(memory_manager, params, kNumICCContexts, tokens,
-                               &code, &context_map, writer, layer, aux_out));
+  JXL_ASSIGN_OR_RETURN(size_t cost, BuildAndEncodeHistograms(
+                                        memory_manager, params, kNumICCContexts,
+                                        tokens, &code, writer, layer, aux_out));
   (void)cost;
-  JXL_RETURN_IF_ERROR(
-      WriteTokens(tokens[0], code, context_map, 0, writer, layer, aux_out));
+  JXL_RETURN_IF_ERROR(WriteTokens(tokens[0], code, 0, writer, layer, aux_out));
   return true;
 }
 

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -152,11 +153,10 @@ void DequantLane(Vec<D> scaled_dequant_x, Vec<D> scaled_dequant_y,
 }
 
 template <ACType ac_type>
-void DequantBlock(const AcStrategy& acs, float inv_global_scale, int quant,
-                  float x_dm_multiplier, float b_dm_multiplier, Vec<D> x_cc_mul,
-                  Vec<D> b_cc_mul, AcStrategyType kind, size_t size,
-                  const Quantizer& quantizer, size_t covered_blocks,
-                  const size_t* sbx,
+void DequantBlock(float inv_global_scale, int quant, float x_dm_multiplier,
+                  float b_dm_multiplier, Vec<D> x_cc_mul, Vec<D> b_cc_mul,
+                  AcStrategyType kind, size_t size, const Quantizer& quantizer,
+                  size_t covered_blocks, const size_t* sbx,
                   const float* JXL_RESTRICT* JXL_RESTRICT dc_row,
                   size_t dc_stride, const float* JXL_RESTRICT biases,
                   ACPtr qblock[3], float* JXL_RESTRICT block,
@@ -175,7 +175,7 @@ void DequantBlock(const AcStrategy& acs, float inv_global_scale, int quant,
                          qblock, block);
   }
   for (size_t c = 0; c < 3; c++) {
-    LowestFrequenciesFromDC(acs.Strategy(), dc_row[c] + sbx[c], dc_stride,
+    LowestFrequenciesFromDC(kind, dc_row[c] + sbx[c], dc_stride,
                             block + c * size, scratch);
   }
 }
@@ -431,7 +431,7 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
           HWY_ALIGN float* const block = group_dec_cache->dec_group_block;
           // Dequantize and add predictions.
           dequant_block(
-              acs, inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
+              inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
               dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
               size, dec_state->shared->quantizer,
               acs.covered_blocks_y() * acs.covered_blocks_x(), sbx, dc_rows,
@@ -521,8 +521,8 @@ Status DecodeACVarBlock(size_t ctx_offset, size_t log2_covered_blocks,
     // signed integer to avoid undefined behavior of shifting negative numbers.
     const size_t magnitude = u_coeff >> 1;
     const size_t neg_sign = (~u_coeff) & 1;
-    const intptr_t coeff =
-        static_cast<intptr_t>((magnitude ^ (neg_sign - 1)) << shift);
+    const ptrdiff_t coeff =
+        static_cast<ptrdiff_t>((magnitude ^ (neg_sign - 1)) << shift);
     if (ac_type == ACType::k16) {
       block.ptr16[order[k]] += coeff;
     } else {
@@ -771,9 +771,9 @@ Status DecodeGroup(const FrameHeader& frame_header,
       RenderPipelineStage::RowInfo output_rows(1, std::vector<float*>(8));
       for (size_t y = src_rect.y0(); y < src_rect.y0() + src_rect.ysize();
            y++) {
-        for (ssize_t iy = 0; iy < 5; iy++) {
+        for (ptrdiff_t iy = 0; iy < 5; iy++) {
           input_rows[0][iy] = group_dec_cache->dc_buffer.Row(
-              Mirror(static_cast<ssize_t>(y) + iy - 2,
+              Mirror(static_cast<ptrdiff_t>(y) + iy - 2,
                      dec_state->shared->dc->Plane(c).ysize() >> vs) +
               2 - src_rect.y0());
         }
@@ -784,8 +784,8 @@ Status DecodeGroup(const FrameHeader& frame_header,
         }
         // Arguments set to 0/nullptr are not used.
         JXL_RETURN_IF_ERROR(dec_state->upsampler8x->ProcessRow(
-            input_rows, output_rows,
-            /*xextra=*/0, src_rect.xsize(), 0, 0, thread));
+            input_rows, output_rows, /*xextra_left=*/0, /*xextra_right=*/0,
+            src_rect.xsize(), 0, 0, thread));
       }
     }
     return true;

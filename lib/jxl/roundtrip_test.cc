@@ -24,6 +24,7 @@
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/butteraugli/butteraugli.h"
+#include "lib/jxl/cms/color_encoding_cms.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/dec_bit_reader.h"
 #include "lib/jxl/enc_external_image.h"
@@ -47,7 +48,7 @@ std::unique_ptr<jxl::CodecInOut> ConvertTestImage(
     const std::vector<uint8_t>& buf, const size_t xsize, const size_t ysize,
     const JxlPixelFormat& pixel_format, const jxl::Bytes& icc_profile) {
   auto io = jxl::make_unique<jxl::CodecInOut>(jxl::test::MemoryManager());
-  jxl::test::Check(io->SetSize(xsize, ysize));
+  Check(io->SetSize(xsize, ysize));
 
   bool is_gray = pixel_format.num_channels < 3;
   bool has_alpha =
@@ -106,7 +107,7 @@ std::unique_ptr<jxl::CodecInOut> ConvertTestImage(
   }
   EXPECT_TRUE(ConvertFromExternal(jxl::Bytes(buf), xsize, ysize, color_encoding,
                                   /*bits_per_sample=*/bitdepth, pixel_format,
-                                  /*pool=*/nullptr, &io->Main()));
+                                  /*pool=*/nullptr, &io->Main(), has_alpha));
   return io;
 }
 
@@ -292,6 +293,7 @@ void VerifyRoundtripCompression(
             JxlEncoderSetUpsamplingMode(enc, resampling, upsampling_mode));
   JxlEncoderFrameSettings* frame_settings =
       JxlEncoderFrameSettingsCreate(enc, nullptr);
+  ASSERT_NE(nullptr, frame_settings);
   JxlEncoderSetFrameLossless(frame_settings, lossless);
   if (resampling > 1) {
     EXPECT_EQ(
@@ -478,13 +480,12 @@ TEST(RoundtripTest, FloatFrameRoundtripTest) {
           uint32_t total_extra_channels = has_alpha + extra_channels.size();
           // There's no support (yet) for lossless extra float
           // channels, so we don't test it.
-          if (total_extra_channels == 0 || !lossless) {
-            JxlPixelFormat pixel_format = JxlPixelFormat{
-                num_channels, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
-            VerifyRoundtripCompression<float>(
-                63, 129, pixel_format, pixel_format, lossless, use_container, 1,
-                false, extra_channels);
-          }
+          if (lossless && (total_extra_channels > 0)) continue;
+          JxlPixelFormat pixel_format = JxlPixelFormat{
+              num_channels, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
+          VerifyRoundtripCompression<float>(63, 129, pixel_format, pixel_format,
+                                            lossless, use_container, 1, false,
+                                            extra_channels);
         }
       }
     }
@@ -606,6 +607,7 @@ TEST(RoundtripTest, ExtraBoxesTest) {
   EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderSetColorEncoding(enc, &color_encoding));
   JxlEncoderFrameSettings* frame_settings =
       JxlEncoderFrameSettingsCreate(enc, nullptr);
+  ASSERT_NE(nullptr, frame_settings);
   JxlEncoderSetFrameLossless(frame_settings, JXL_FALSE);
   EXPECT_EQ(
       JXL_ENC_SUCCESS,
@@ -721,6 +723,7 @@ TEST(RoundtripTest, MultiFrameTest) {
               JxlEncoderSetColorEncoding(enc, &color_encoding));
     JxlEncoderFrameSettings* frame_settings =
         JxlEncoderFrameSettingsCreate(enc, nullptr);
+    ASSERT_NE(nullptr, frame_settings);
     JxlEncoderSetFrameLossless(frame_settings, JXL_FALSE);
     if (index_frames == 1) {
       EXPECT_EQ(JXL_ENC_SUCCESS,
@@ -884,6 +887,7 @@ TEST(RoundtripTest, TestICCProfile) {
             JxlEncoderSetICCProfile(enc, icc.data(), icc.size()));
   JxlEncoderFrameSettings* frame_settings =
       JxlEncoderFrameSettingsCreate(enc, nullptr);
+  ASSERT_NE(nullptr, frame_settings);
   EXPECT_EQ(
       JXL_ENC_SUCCESS,
       JxlEncoderAddImageFrame(frame_settings, &format,
@@ -953,6 +957,7 @@ JXL_TRANSCODE_JPEG_TEST(RoundtripTest, TestJPEGReconstruction) {
   JxlEncoderPtr enc = JxlEncoderMake(nullptr);
   JxlEncoderFrameSettings* frame_settings =
       JxlEncoderFrameSettingsCreate(enc.get(), nullptr);
+  ASSERT_NE(nullptr, frame_settings);
 
   EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderUseContainer(enc.get(), JXL_TRUE));
   EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderStoreJPEGMetadata(enc.get(), JXL_TRUE));
@@ -1059,6 +1064,7 @@ JXL_TRANSCODE_JPEG_TEST(RoundtripTest,
   JxlEncoderPtr enc = JxlEncoderMake(nullptr);
   JxlEncoderFrameSettings* frame_settings =
       JxlEncoderFrameSettingsCreate(enc.get(), nullptr);
+  ASSERT_NE(nullptr, frame_settings);
 
   EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderUseContainer(enc.get(), JXL_TRUE));
   EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderStoreJPEGMetadata(enc.get(), JXL_TRUE));

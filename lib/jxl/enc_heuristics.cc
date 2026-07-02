@@ -33,6 +33,7 @@
 #include "lib/jxl/chroma_from_luma.h"
 #include "lib/jxl/coeff_order.h"
 #include "lib/jxl/coeff_order_fwd.h"
+#include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/common.h"
 #include "lib/jxl/dct_util.h"
 #include "lib/jxl/dec_cache.h"
@@ -787,10 +788,11 @@ StatusOr<Image3F> ReconstructImage(
                           FrameHeader::kSplines);
   frame_header.color_transform = ColorTransform::kNone;
 
-  CodecMetadata metadata = *frame_header.nonserialized_metadata;
-  metadata.m.extra_channel_info.clear();
-  metadata.m.num_extra_channels = metadata.m.extra_channel_info.size();
-  frame_header.nonserialized_metadata = &metadata;
+  auto metadata = jxl::make_unique<CodecMetadata>();
+  *metadata = *frame_header.nonserialized_metadata;
+  metadata->m.extra_channel_info.clear();
+  metadata->m.num_extra_channels = metadata->m.extra_channel_info.size();
+  frame_header.nonserialized_metadata = metadata.get();
   frame_header.extra_channel_upsampling.clear();
 
   const bool is_gray = shared.metadata->m.color_encoding.IsGray();
@@ -941,9 +943,7 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   }
   std::vector<std::vector<size_t>> histo(9, std::vector<size_t>(kNumEPFVals));
   std::vector<size_t> totals(9, 1);
-  const float c5 = 0.007620386618483585f;
-  const float c6 = 0.0083224805679680686f;
-  const float c7 = 0.99663939685686753;
+  static const float kFavorNoSmoothing = 0.99;
   for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
     uint8_t* JXL_RESTRICT out_row = epf_sharpness.Row(by);
     uint8_t* JXL_RESTRICT prev_row = epf_sharpness.Row(by > 0 ? by - 1 : 0);
@@ -957,15 +957,14 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       for (uint8_t val : epf_steps) {
         float error = error_images[val].Row(by)[bx];
         if (val == 0) {
-          error *= c7 - c5 * clamped_butteraugli;
+          error *= kFavorNoSmoothing;
         }
         if (error < best_error) {
           best_val = val;
           best_error = error;
         }
       }
-      if (best_error <
-          (1.0 - c6 * clamped_butteraugli) * std::min(top_error, left_error)) {
+      if (best_error < std::min(top_error, left_error)) {
         out_row[bx] = best_val;
       } else if (top_error < left_error) {
         out_row[bx] = top_val;
@@ -977,12 +976,26 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       ++totals[context];
     }
   }
-  const float c1 = 0.059588212153340203f;
-  const float c2 = 0.10599497107315753f;
-  const float c3base = 0.97;
-  const float c3 = pow(c3base, clamped_butteraugli);
-  const float c4 = 1.247544678665836f;
-  const float context_weight = c1 + c2 * clamped_butteraugli;
+  const float c3base = 0.98017198824148288;
+  const float c3clamp = 0.85970338919928291;
+  const float c3 = std::max(c3clamp, std::pow(c3base, clamped_butteraugli));
+  static const float c5 = 0.1087690359555803;
+  float mul[3 * 3 * 3] = {0};
+  for (uint8_t top_val : epf_steps) {
+    for (uint8_t left_val : epf_steps) {
+      for (uint8_t val : epf_steps) {
+        int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
+        const auto& ctx_histo = histo[context];
+        const int mulix = epf_steps_lut[val] + 3 * context;
+        mul[mulix] =
+            1.0 / (1.0 + c5 * std::log1p(ctx_histo[val] / totals[context]) /
+                             clamped_butteraugli);
+        if (val == 0) {
+          mul[mulix] *= c3;
+        }
+      }
+    }
+  }
   for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
     uint8_t* JXL_RESTRICT out_row = epf_sharpness.Row(by);
     uint8_t* JXL_RESTRICT prev_row = epf_sharpness.Row(by > 0 ? by - 1 : 0);
@@ -992,14 +1005,9 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       uint8_t top_val = by > 0 ? prev_row[bx] : 0;
       uint8_t left_val = bx > 0 ? out_row[bx - 1] : 0;
       int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
-      const auto& ctx_histo = histo[context];
       for (uint8_t val : epf_steps) {
-        float error = error_images[val].Row(by)[bx] /
-                      (c4 + std::log1p(ctx_histo[val] * context_weight /
-                                       totals[context]));
-        if (val == 0) {
-          error *= c3;
-        }
+        int mulix = epf_steps_lut[val] + 3 * context;
+        float error = error_images[val].Row(by)[bx] * mul[mulix];
         if (error < best_error) {
           best_val = val;
           best_error = error;
@@ -1034,11 +1042,12 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
   // Find and subtract splines.
-  if (cparams.custom_splines.HasAny()) {
-    image_features.splines = cparams.custom_splines;
+  bool override_splines = cparams.custom_splines.HasAny();
+  if (override_splines) {
+    image_features.splines.SetData(cparams.custom_splines);
   }
   if (!streaming_mode && cparams.speed_tier <= SpeedTier::kSquirrel) {
-    if (!cparams.custom_splines.HasAny()) {
+    if (!override_splines) {
       image_features.splines = FindSplines(*opsin);
     }
     JXL_RETURN_IF_ERROR(image_features.splines.InitializeDrawCache(

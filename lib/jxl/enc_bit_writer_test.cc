@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "lib/jxl/base/common.h"
-#include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/dec_bit_reader.h"
 #include "lib/jxl/enc_aux_out.h"
@@ -34,7 +33,7 @@ struct BitPatch {
 TEST(BitWriterTest, RandomSequence) {
   JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
 
-  auto mt = std::make_unique<std::mt19937>(42);
+  auto mt = jxl::make_unique<std::mt19937>(42);
   std::uniform_int_distribution<> num_bits_dist(1, BitWriter::kMaxBitsPerCall);
   constexpr size_t kNumSequences = 1024 * 1024;
   std::vector<BitPatch> content;
@@ -68,7 +67,7 @@ TEST(BitWriterTest, RandomSequence) {
   }
   EXPECT_TRUE(reader.JumpToByteBoundary());
   EXPECT_TRUE(reader.Close());
-  EXPECT_EQ(num_mismatches, 0);
+  EXPECT_EQ(num_mismatches, 0u);
 }
 
 }  // namespace

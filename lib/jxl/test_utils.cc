@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "lib/extras/codec_in_out.h"
 #include "lib/extras/dec/jxl.h"
 #include "lib/extras/enc/jxl.h"
 #include "lib/extras/metrics.h"
@@ -40,7 +41,8 @@
 #include "lib/jxl/base/printf_macros.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/butteraugli/butteraugli.h"
+#include "lib/jxl/cms/color_encoding_cms.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/dec_bit_reader.h"
 #include "lib/jxl/enc_aux_out.h"
@@ -58,6 +60,10 @@
 #include "lib/jxl/icc_codec.h"
 #include "lib/jxl/image.h"
 #include "lib/jxl/image_bundle.h"
+#include "lib/jxl/image_metadata.h"
+#include "lib/jxl/jpeg/enc_jpeg_data.h"
+#include "lib/jxl/jpeg/jpeg_data.h"
+#include "lib/jxl/luminance.h"
 #include "lib/jxl/padded_bytes.h"
 #include "lib/jxl/test_memory_manager.h"
 
@@ -68,8 +74,9 @@
 namespace jxl {
 namespace test {
 
-void Check(bool ok) {
+void CheckImpl(bool ok, const char* condition, const char* file, int line) {
   if (!ok) {
+    fprintf(stderr, "Check(%s) failed at %s:%d\n", condition, file, line);
     JXL_CRASH();
   }
 }
@@ -274,7 +281,7 @@ bool Roundtrip(CodecInOut* io, const CompressParams& cparams,
 size_t Roundtrip(const extras::PackedPixelFile& ppf_in,
                  const extras::JXLCompressParams& cparams,
                  const extras::JXLDecompressParams& dparams, ThreadPool* pool,
-                 extras::PackedPixelFile* ppf_out) {
+                 extras::PackedPixelFile* ppf_out, size_t* decoded_size) {
   extras::JXLDecompressParams local_dparams(dparams);
   DefaultAcceptedFormats(local_dparams);
   SetThreadParallelRunner(cparams, pool);
@@ -285,7 +292,11 @@ size_t Roundtrip(const extras::PackedPixelFile& ppf_in,
   size_t decoded_bytes = 0;
   Check(extras::DecodeImageJXL(compressed.data(), compressed.size(),
                                local_dparams, &decoded_bytes, ppf_out));
-  Check(decoded_bytes == compressed.size());
+  if (decoded_size) {
+    *decoded_size = decoded_bytes;
+  } else {
+    Check(decoded_bytes == compressed.size());
+  }
   return compressed.size();
 }
 
@@ -338,7 +349,7 @@ std::unique_ptr<jxl::CodecInOut> SomeTestImageToCodecInOut(
       jxl::ColorEncoding::SRGB(/*is_gray=*/num_channels < 3),
       /*bits_per_sample=*/16, format,
       /*pool=*/nullptr,
-      /*ib=*/&io->Main()));
+      /*ib=*/&io->Main(), /*set_alpha=*/true));
   return io;
 }
 
@@ -406,7 +417,7 @@ std::vector<double> ConvertToRGBA32(const uint8_t* pixels, size_t xsize,
   size_t stride =
       xsize * jxl::DivCeil(GetDataBits(format.data_type) * num_channels,
                            jxl::kBitsPerByte);
-  if (format.align > 1) stride = jxl::RoundUpTo(stride, format.align);
+  Check(SafeRoundUpTo(stride, format.align, stride));
 
   if (format.data_type == JXL_TYPE_UINT8) {
     // Multiplier to bring to 0-1.0 range
@@ -540,7 +551,7 @@ size_t ComparePixels(const uint8_t* a, const uint8_t* b, size_t xsize,
   if (format_a.data_type == JXL_TYPE_FLOAT16 ||
       format_b.data_type == JXL_TYPE_FLOAT16) {
     // Lower the precision for float16, because it currently looks like the
-    // scalar and wasm implementations of hwy have 1 less bit of precision
+    // scalar and WASM implementations of hwy have 1 less bit of precision
     // than the x86 implementations.
     // TODO(lode): Set the required precision back to 11 bits when possible.
     precision = 0.5 * threshold_multiplier / ((1ull << (bits - 1)) - 1ull);
@@ -769,10 +780,10 @@ bool SamePixels(const extras::PackedPixelFile& a,
 
 Status ReadICC(BitReader* JXL_RESTRICT reader,
                std::vector<uint8_t>* JXL_RESTRICT icc) {
-  JxlMemoryManager* memort_manager = jxl::test::MemoryManager();
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
   icc->clear();
-  ICCReader icc_reader{memort_manager};
-  PaddedBytes icc_buffer{memort_manager};
+  ICCReader icc_reader{memory_manager};
+  PaddedBytes icc_buffer{memory_manager};
   JXL_RETURN_IF_ERROR(icc_reader.Init(reader));
   JXL_RETURN_IF_ERROR(icc_reader.Process(reader, &icc_buffer));
   Bytes(icc_buffer).AppendTo(*icc);
@@ -931,6 +942,32 @@ StatusOr<Image3F> GetColorImage(const extras::PackedPixelFile& ppf) {
         ppf.info.bits_per_sample, format, c, nullptr, &color.Plane(c)));
   }
   return color;
+}
+
+Status JpegDataToCodecInOut(std::unique_ptr<jxl::jpeg::JPEGData>&& data,
+                            CodecInOut* io) {
+  JxlMemoryManager* memory_manager = io->memory_manager;
+  io->frames.clear();
+  io->frames.reserve(1);
+  io->frames.emplace_back(memory_manager, &io->metadata.m);
+  io->Main().jpeg_data = std::move(data);
+  jpeg::JPEGData* jpeg_data = io->Main().jpeg_data.get();
+  JXL_RETURN_IF_ERROR(jxl::jpeg::SetColorEncodingFromJpegData(
+      *jpeg_data, &io->metadata.m.color_encoding));
+  JXL_RETURN_IF_ERROR(jxl::jpeg::SetChromaSubsamplingFromJpegData(
+      *jpeg_data, &io->Main().chroma_subsampling));
+  JXL_RETURN_IF_ERROR(jxl::jpeg::SetColorTransformFromJpegData(
+      *jpeg_data, &io->Main().color_transform));
+
+  io->metadata.m.SetIntensityTarget(kDefaultIntensityTarget);
+  io->metadata.m.SetUintSamples(8);
+  JXL_ASSIGN_OR_RETURN(
+      Image3F tmp,
+      Image3F::Create(memory_manager, jpeg_data->width, jpeg_data->height));
+  JXL_RETURN_IF_ERROR(
+      io->SetFromImage(std::move(tmp), io->metadata.m.color_encoding));
+  SetIntensityTarget(&io->metadata.m);
+  return true;
 }
 
 }  // namespace test

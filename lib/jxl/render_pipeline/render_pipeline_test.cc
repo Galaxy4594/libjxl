@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -41,6 +42,7 @@
 #include "lib/jxl/image_ops.h"
 #include "lib/jxl/image_test_utils.h"
 #include "lib/jxl/jpeg/enc_jpeg_data.h"
+#include "lib/jxl/jpeg/jpeg_data.h"
 #include "lib/jxl/render_pipeline/test_render_pipeline_stages.h"
 #include "lib/jxl/splines.h"
 #include "lib/jxl/test_memory_manager.h"
@@ -144,7 +146,7 @@ TEST(RenderPipelineTest, CallAllGroups) {
     ASSERT_TRUE(input_buffers.Done());
   }
 
-  EXPECT_EQ(pipeline->PassesWithAllInput(), 1);
+  EXPECT_EQ(pipeline->PassesWithAllInput(), 1u);
 }
 
 TEST(RenderPipelineTest, BuildFast) {
@@ -186,7 +188,7 @@ TEST(RenderPipelineTest, CallAllGroupsFast) {
     ASSERT_TRUE(input_buffers.Done());
   }
 
-  EXPECT_EQ(pipeline->PassesWithAllInput(), 1);
+  EXPECT_EQ(pipeline->PassesWithAllInput(), 1u);
 }
 
 struct RenderPipelineTestInputSettings {
@@ -201,7 +203,7 @@ struct RenderPipelineTestInputSettings {
 
   bool add_spot_color = false;
 
-  Splines splines;
+  bool has_splines;
 
   JXL_NOINLINE void Reset() {
     input_path.clear();
@@ -211,9 +213,34 @@ struct RenderPipelineTestInputSettings {
     cparams = CompressParams();
     cparams_descr.clear();
     add_spot_color = false;
-    splines.Clear();
+    has_splines = false;
   }
 };
+
+Status CreateTestSplines(std::vector<QuantizedSpline>& quantized_splines,
+                         std::vector<Spline::Point>& starting_points) {
+  quantized_splines.clear();
+  starting_points.clear();
+  const ColorCorrelation color_correlation{};
+  std::vector<Spline::Point> control_points{{9, 54},  {118, 159}, {97, 3},
+                                            {10, 40}, {150, 25},  {120, 300}};
+  const Spline spline{control_points,
+                      /*color_dct=*/
+                      {Dct32{0.03125f, 0.00625f, 0.003125f},
+                       Dct32{1.f, 0.321875f}, Dct32{1.f, 0.24375f}},
+                      /*sigma_dct=*/{0.3125f, 0.f, 0.f, 0.0625f}};
+  std::vector<Spline> spline_data = {spline};
+  for (const Spline& ospline : spline_data) {
+    JXL_ASSIGN_OR_RETURN(
+        QuantizedSpline qspline,
+        QuantizedSpline::Create(ospline, /*quantization_adjustment=*/0,
+                                color_correlation.YtoXRatio(0),
+                                color_correlation.YtoBRatio(0)));
+    quantized_splines.emplace_back(std::move(qspline));
+    starting_points.push_back(ospline.control_points.front());
+  }
+  return true;
+}
 
 class RenderPipelineTestParam
     : public ::testing::TestWithParam<RenderPipelineTestInputSettings> {};
@@ -230,7 +257,10 @@ TEST_P(RenderPipelineTestParam, PipelineTest) {
 
   auto io = jxl::make_unique<CodecInOut>(memory_manager);
   if (config.jpeg_transcode) {
-    ASSERT_TRUE(jpeg::DecodeImageJPG(Bytes(orig), io.get()));
+    JXL_TEST_ASSIGN_OR_DIE(std::unique_ptr<jxl::jpeg::JPEGData> jpeg_data,
+                           jpeg::ParseJPG(memory_manager, Bytes(orig)));
+    ASSERT_TRUE(
+        jxl::test::JpegDataToCodecInOut(std::move(jpeg_data), io.get()));
   } else {
     ASSERT_TRUE(SetFromBytes(Bytes(orig), io.get(), &pool));
   }
@@ -265,7 +295,16 @@ TEST_P(RenderPipelineTestParam, PipelineTest) {
 
   std::vector<uint8_t> compressed;
 
-  config.cparams.custom_splines = config.splines;
+  std::vector<QuantizedSpline> quantized_splines;
+  std::vector<Spline::Point> starting_points;
+  if (config.has_splines) {
+    ASSERT_TRUE(CreateTestSplines(quantized_splines, starting_points));
+    config.cparams.custom_splines = {
+        Span<const QuantizedSpline>(quantized_splines),
+        Span<const Spline::Point>(starting_points)};
+  } else {
+    config.cparams.custom_splines = {};
+  }
   ASSERT_TRUE(test::EncodeFile(config.cparams, io.get(), &compressed, &pool));
 
   auto io_default = jxl::make_unique<CodecInOut>(memory_manager);
@@ -295,31 +334,6 @@ TEST_P(RenderPipelineTestParam, PipelineTest) {
   }
 }
 
-StatusOr<Splines> CreateTestSplines() {
-  const ColorCorrelation color_correlation{};
-  std::vector<Spline::Point> control_points{{9, 54},  {118, 159}, {97, 3},
-                                            {10, 40}, {150, 25},  {120, 300}};
-  const Spline spline{control_points,
-                      /*color_dct=*/
-                      {Dct32{0.03125f, 0.00625f, 0.003125f},
-                       Dct32{1.f, 0.321875f}, Dct32{1.f, 0.24375f}},
-                      /*sigma_dct=*/{0.3125f, 0.f, 0.f, 0.0625f}};
-  std::vector<Spline> spline_data = {spline};
-  std::vector<QuantizedSpline> quantized_splines;
-  std::vector<Spline::Point> starting_points;
-  for (const Spline& ospline : spline_data) {
-    JXL_ASSIGN_OR_RETURN(
-        QuantizedSpline qspline,
-        QuantizedSpline::Create(ospline, /*quantization_adjustment=*/0,
-                                color_correlation.YtoXRatio(0),
-                                color_correlation.YtoBRatio(0)));
-    quantized_splines.emplace_back(std::move(qspline));
-    starting_points.push_back(ospline.control_points.front());
-  }
-  return Splines(/*quantization_adjustment=*/0, std::move(quantized_splines),
-                 std::move(starting_points));
-}
-
 std::vector<RenderPipelineTestInputSettings> GeneratePipelineTests() {
   std::vector<RenderPipelineTestInputSettings> all_tests;
 
@@ -327,7 +341,8 @@ std::vector<RenderPipelineTestInputSettings> GeneratePipelineTests() {
       {3, 8}, {128, 128}, {256, 256}, {258, 258}, {533, 401}, {777, 777},
   };
 
-  RenderPipelineTestInputSettings stub;
+  auto stub_heap = jxl::make_unique<RenderPipelineTestInputSettings>();
+  RenderPipelineTestInputSettings& stub = *stub_heap;
   stub.input_path = "jxl/flower/flower.png";
 
   // Base settings.
@@ -338,7 +353,8 @@ std::vector<RenderPipelineTestInputSettings> GeneratePipelineTests() {
   stub.cparams.epf = 0;
   stub.cparams.color_transform = ColorTransform::kXYB;
 
-  RenderPipelineTestInputSettings s;
+  auto s_heap = jxl::make_unique<RenderPipelineTestInputSettings>();
+  RenderPipelineTestInputSettings& s = *s_heap;
 
   for (auto size : sizes) {
     stub.xsize = size.first;
@@ -396,7 +412,7 @@ std::vector<RenderPipelineTestInputSettings> GeneratePipelineTests() {
     {
       s = stub;
       s.cparams_descr = "Splines";
-      JXL_TEST_ASSIGN_OR_DIE(s.splines, CreateTestSplines());
+      s.has_splines = true;
       all_tests.push_back(s);
     }
 

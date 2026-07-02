@@ -7,15 +7,16 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 #include "lib/extras/codec.h"
+#include "lib/extras/codec_in_out.h"
 #include "lib/extras/size_constraints.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/codec_in_out.h"
 #include "lib/jxl/fuzztest.h"
 #include "tools/thread_pool_internal.h"
 #include "tools/tracking_memory_manager.h"
@@ -30,11 +31,13 @@ using ::jxl::CodecInOut;
 using ::jxl::SizeConstraints;
 using ::jxl::Status;
 
-void Check(bool ok) {
+void CheckImpl(bool ok, const char* condition, const char* file, int line) {
   if (!ok) {
+    fprintf(stderr, "Check(%s) failed at %s:%d\n", condition, file, line);
     JXL_CRASH();
   }
 }
+#define Check(OK) CheckImpl((OK), #OK, __FILE__, __LINE__)
 
 Status Run(const uint8_t* data, size_t size, JxlMemoryManager* memory_manager,
            const SizeConstraints& constraints) {

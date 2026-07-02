@@ -11,7 +11,6 @@
 
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
-#include "lib/jxl/base/matrix_ops.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/dec_xyb.h"
 #include "lib/jxl/render_pipeline/render_pipeline_stage.h"
@@ -35,13 +34,13 @@ namespace {
 using hwy::HWY_NAMESPACE::IfThenZeroElse;
 
 struct OpLinear {
-  explicit OpLinear(const OutputEncodingInfo&) {}
+  explicit OpLinear(const OutputEncodingInfo& output_encoding_info) {}
   template <typename D, typename T>
   void Transform(D d, T* r, T* g, T* b) const {}
 };
 
 struct OpRgb {
-  explicit OpRgb(const OutputEncodingInfo&) {}
+  explicit OpRgb(const OutputEncodingInfo& output_encoding_info) {}
   template <typename D, typename T>
   void Transform(D d, T* r, T* g, T* b) const {
     for (T* val : {r, g, b}) {
@@ -83,7 +82,7 @@ struct OpHlg {
 };
 
 struct Op709 {
-  explicit Op709(const OutputEncodingInfo&) {}
+  explicit Op709(const OutputEncodingInfo& output_encoding_info) {}
   template <typename D, typename T>
   void Transform(D d, T* r, T* g, T* b) const {
     for (T* val : {r, g, b}) {
@@ -113,21 +112,23 @@ class FromLinearStage : public RenderPipelineStage {
         op_(output_encoding_info) {}
 
   Status ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
-                    size_t xextra, size_t xsize, size_t xpos, size_t ypos,
-                    size_t thread_id) const final {
+                    size_t xextra_left, size_t xextra_right, size_t xsize,
+                    size_t xpos, size_t ypos, size_t thread_id) const final {
+    JXL_ENSURE(xextra_left == 0 && xextra_right == 0);
     const HWY_FULL(float) d;
-    const size_t xsize_v = RoundUpTo(xsize, Lanes(d));
+
+    size_t x_span_tail = RoundUpTo(xsize, Lanes(d)) - xsize;
     float* JXL_RESTRICT row0 = GetInputRow(input_rows, 0, 0);
     float* JXL_RESTRICT row1 = GetInputRow(input_rows, 1, 0);
     float* JXL_RESTRICT row2 = GetInputRow(input_rows, 2, 0);
     // All calculations are lane-wise, still some might require
     // value-dependent behaviour (e.g. NearestInt). Temporary unpoison last
     // vector tail.
-    msan::UnpoisonMemory(row0 + xsize, sizeof(float) * (xsize_v - xsize));
-    msan::UnpoisonMemory(row1 + xsize, sizeof(float) * (xsize_v - xsize));
-    msan::UnpoisonMemory(row2 + xsize, sizeof(float) * (xsize_v - xsize));
-    for (ssize_t x = -xextra; x < static_cast<ssize_t>(xsize + xextra);
-         x += Lanes(d)) {
+    msan::UnpoisonMemory(row0 + xsize, sizeof(float) * x_span_tail);
+    msan::UnpoisonMemory(row1 + xsize, sizeof(float) * x_span_tail);
+    msan::UnpoisonMemory(row2 + xsize, sizeof(float) * x_span_tail);
+    // TODO(eustas): why load/store unaligned?
+    for (size_t x = 0; x < xsize; x += Lanes(d)) {
       auto r = LoadU(d, row0 + x);
       auto g = LoadU(d, row1 + x);
       auto b = LoadU(d, row2 + x);
@@ -136,9 +137,9 @@ class FromLinearStage : public RenderPipelineStage {
       StoreU(g, d, row1 + x);
       StoreU(b, d, row2 + x);
     }
-    msan::PoisonMemory(row0 + xsize, sizeof(float) * (xsize_v - xsize));
-    msan::PoisonMemory(row1 + xsize, sizeof(float) * (xsize_v - xsize));
-    msan::PoisonMemory(row2 + xsize, sizeof(float) * (xsize_v - xsize));
+    msan::PoisonMemory(row0 + xsize, sizeof(float) * x_span_tail);
+    msan::PoisonMemory(row1 + xsize, sizeof(float) * x_span_tail);
+    msan::PoisonMemory(row2 + xsize, sizeof(float) * x_span_tail);
     return true;
   }
 

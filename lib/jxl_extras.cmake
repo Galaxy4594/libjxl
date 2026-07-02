@@ -5,9 +5,9 @@
 
 include(jxl_lists.cmake)
 
-# Object library for those parts of extras that do not depend on jxl internals
-# or jpegli. We will create two versions of these object files, one with and one
-# without external codec support compiled in.
+# Object library for those parts of extras that do not depend on jxl internals.
+# We will create two versions of these object files, one with and one without
+# external codec support compiled in.
 list(APPEND JPEGXL_EXTRAS_CORE_SOURCES
   "${JPEGXL_INTERNAL_EXTRAS_SOURCES}"
   "${JPEGXL_INTERNAL_CODEC_APNG_SOURCES}"
@@ -64,17 +64,6 @@ if (JPEGXL_ENABLE_SJPEG)
   list(APPEND JXL_EXTRAS_CODEC_INTERNAL_LIBRARIES sjpeg)
 endif()
 
-if(JPEGXL_ENABLE_JPEGLI)
-  add_library(jxl_extras_jpegli-obj OBJECT
-    "${JPEGXL_INTERNAL_CODEC_JPEGLI_SOURCES}"
-  )
-  target_include_directories(jxl_extras_jpegli-obj PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}/include/jpegli"
-  )
-  list(APPEND JXL_EXTRAS_OBJECT_LIBRARIES jxl_extras_jpegli-obj)
-  list(APPEND JXL_EXTRAS_OBJECTS $<TARGET_OBJECTS:jxl_extras_jpegli-obj>)
-endif()
-
 if(NOT JPEGXL_BUNDLE_LIBPNG)
   find_package(PNG)
 endif()
@@ -87,32 +76,36 @@ if(PNG_FOUND)
 endif()
 
 if (JPEGXL_ENABLE_OPENEXR)
-pkg_check_modules(OpenEXR IMPORTED_TARGET OpenEXR)
-if (OpenEXR_FOUND)
-  target_include_directories(jxl_extras_core-obj PRIVATE
-    "${OpenEXR_INCLUDE_DIRS}"
-  )
-  target_compile_definitions(jxl_extras_core-obj PRIVATE -DJPEGXL_ENABLE_EXR=1)
-  list(APPEND JXL_EXTRAS_CODEC_INTERNAL_LIBRARIES PkgConfig::OpenEXR)
-  if(JPEGXL_DEP_LICENSE_DIR)
-    configure_file("${JPEGXL_DEP_LICENSE_DIR}/libopenexr-dev/copyright"
-                   ${PROJECT_BINARY_DIR}/LICENSE.libopenexr COPYONLY)
-  endif()  # JPEGXL_DEP_LICENSE_DIR
-  # OpenEXR generates exceptions, so we need exception support to catch them.
-  # Actually those flags counteract the ones set in JPEGXL_INTERNAL_FLAGS.
-  if (NOT WIN32)
-    set(_exr_flags "-fexceptions")
-    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-      set(_exr_flags "-fcxx-exceptions")
-    endif()
-    if ("${OpenEXR_VERSION}" VERSION_LESS "2.5.7")
-      string(APPEND _exr_flags " -Wno-deprecated-copy")
-    endif()
-    set_source_files_properties(extras/dec/exr.cc extras/enc/exr.cc
-      PROPERTIES COMPILE_FLAGS "${_exr_flags}"
+  pkg_check_modules(OpenEXR IMPORTED_TARGET OpenEXR)
+  if (OpenEXR_FOUND)
+    target_include_directories(jxl_extras_core-obj PRIVATE
+      "${OpenEXR_INCLUDE_DIRS}"
     )
-  endif() # WIN32
-endif() # OpenEXR_FOUND
+    target_compile_definitions(jxl_extras_core-obj PRIVATE -DJPEGXL_ENABLE_EXR=1)
+    list(APPEND JXL_EXTRAS_CODEC_INTERNAL_LIBRARIES PkgConfig::OpenEXR)
+    if(JPEGXL_DEP_LICENSE_DIR)
+      configure_file("${JPEGXL_DEP_LICENSE_DIR}/libopenexr-dev/copyright"
+                    ${PROJECT_BINARY_DIR}/LICENSE.libopenexr COPYONLY)
+    endif()  # JPEGXL_DEP_LICENSE_DIR
+    # OpenEXR generates exceptions, so we need exception support to catch them.
+    # Actually those flags counteract the ones set in JPEGXL_INTERNAL_FLAGS.
+    if (NOT WIN32)
+      set(_exr_flags "")
+      # With "-fexceptions" + LTO GCC fails to link.
+      if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # GCC does not support that
+        set(_exr_flags "-fcxx-exceptions")
+      endif()
+      if ("${OpenEXR_VERSION}" VERSION_LESS "2.5.7")
+        string(APPEND _exr_flags " -Wno-deprecated-copy")
+      endif()
+      set_source_files_properties(extras/dec/exr.cc extras/enc/exr.cc
+        PROPERTIES COMPILE_FLAGS "${_exr_flags}"
+      )
+    endif() # WIN32
+  else()
+    message(WARNING "OpenEXR NOT found")
+  endif() # OpenEXR_FOUND
 endif() # JPEGXL_ENABLE_OPENEXR
 
 # Common settings for the object libraries.
@@ -146,10 +139,6 @@ target_link_libraries(jxl_extras-internal PRIVATE
   jxl_threads
 )
 target_link_libraries(jxl_extras-internal PUBLIC jxl-internal)
-if(JPEGXL_ENABLE_JPEGLI)
-  target_compile_definitions(jxl_extras-internal PUBLIC -DJPEGXL_ENABLE_JPEGLI=1)
-  target_link_libraries(jxl_extras-internal PRIVATE jpegli-static)
-endif()
 
 ### Library that does not depend on internal parts of jxl library.
 ### Used by cjxl and djxl binaries.

@@ -20,11 +20,14 @@
 #include <utility>
 #include <vector>
 
+#include "lib/extras/codec_in_out.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/override.h"
+#include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/cms/color_encoding_cms.h"
 #include "lib/jxl/color_encoding_internal.h"
+#include "lib/jxl/common.h"
 #include "lib/jxl/enc_bit_writer.h"
 #include "lib/jxl/enc_cache.h"
 #include "lib/jxl/enc_fields.h"
@@ -37,6 +40,7 @@
 #include "lib/jxl/modular/encoding/dec_ma.h"
 #include "lib/jxl/modular/encoding/enc_debug_tree.h"
 #include "lib/jxl/modular/options.h"
+#include "lib/jxl/noise.h"
 #include "lib/jxl/splines.h"
 #include "lib/jxl/test_utils.h"  // TODO(eustas): cut this dependency
 #include "tools/file_io.h"
@@ -61,9 +65,10 @@ using ::jxl::PassesEncoderState;
 using ::jxl::Predictor;
 using ::jxl::PropertyDecisionNode;
 using ::jxl::QuantizedSpline;
+using ::jxl::Span;
 using ::jxl::Spline;
 using ::jxl::Splines;
-using ::jxl::StatusOr;
+using ::jxl::Status;
 using ::jxl::Tree;
 
 namespace {
@@ -72,9 +77,11 @@ struct SplineData {
   std::vector<Spline> splines;
 };
 
-StatusOr<Splines> SplinesFromSplineData(const SplineData& spline_data) {
-  std::vector<QuantizedSpline> quantized_splines;
-  std::vector<Spline::Point> starting_points;
+Status SplinesFromSplineData(const SplineData& spline_data,
+                             std::vector<QuantizedSpline>& quantized_splines,
+                             std::vector<Spline::Point>& starting_points) {
+  quantized_splines.clear();
+  starting_points.clear();
   quantized_splines.reserve(spline_data.splines.size());
   starting_points.reserve(spline_data.splines.size());
   for (const Spline& spline : spline_data.splines) {
@@ -85,8 +92,7 @@ StatusOr<Splines> SplinesFromSplineData(const SplineData& spline_data) {
     quantized_splines.emplace_back(std::move(qspline));
     starting_points.push_back(spline.control_points.front());
   }
-  return Splines(spline_data.quantization_adjustment,
-                 std::move(quantized_splines), std::move(starting_points));
+  return true;
 }
 
 template <typename F>
@@ -432,11 +438,12 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
     for (size_t i = 0; i < 8; i++) {
       t = tok();
       size_t num = 0;
-      cparams.manual_noise[i] = std::stof(t, &num);
-      if (num != t.size()) {
+      float v = std::stof(t, &num);
+      if (num != t.size() || v < 0.0f || v > 1.0f) {
         fprintf(stderr, "Invalid noise entry: %s\n", t.c_str());
         return false;
       }
+      cparams.manual_noise[i] = jxl::Clamp1(v, 0.0f, jxl::kNoiseLutMax);
     }
   } else if (t == "XYBFactors") {
     cparams.manual_xyb_factors.resize(3);
@@ -460,6 +467,9 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
   } else if (t == "Rec2100") {
     JXL_RETURN_IF_ERROR(
         io.metadata.m.color_encoding.SetPrimariesType(jxl::Primaries::k2100));
+  } else if (t == "P3") {
+    JXL_RETURN_IF_ERROR(
+        io.metadata.m.color_encoding.SetPrimariesType(jxl::Primaries::kP3));
   } else if (t == "16BitBuffers") {
     io.metadata.m.modular_16_bit_buffer_sufficient = true;
   } else {
@@ -487,6 +497,7 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
   cparams.ec_resampling = 1;
   cparams.modular_group_size_shift = 3;
   cparams.colorspace = 0;
+  cparams.speed_tier = jxl::SpeedTier::kGlacier;
   cparams.buffering = 0;
   JxlMemoryManager* memory_manager = jpegxl::tools::NoMemoryManager();
   auto io = jxl::make_unique<CodecInOut>(memory_manager);
@@ -508,19 +519,17 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
   };
   if (!ParseNode(tok, tree, spline_data, cparams, width, height, *io, have_next,
                  x0, y0)) {
-    return 1;
+    return JXL_FAILURE("Failed to ParseNode");
   }
 
   if (tree_out) {
     PrintTree(tree, tree_out);
   }
-  JXL_ASSIGN_OR_RETURN(
-      Image3F image, Image3F::Create(memory_manager, width * cparams.resampling,
-                                     height * cparams.resampling));
+  JXL_ASSIGN_OR_RETURN(Image3F image,
+                       Image3F::Create(memory_manager, width, height));
   JXL_RETURN_IF_ERROR(
       io->SetFromImage(std::move(image), io->metadata.m.color_encoding));
-  JXL_RETURN_IF_ERROR(io->SetSize((width + x0) * cparams.resampling,
-                                  (height + y0) * cparams.resampling));
+  JXL_RETURN_IF_ERROR(io->SetSize((width + x0), (height + y0)));
 
   io->metadata.m.color_encoding.DecideIfWantICC(*JxlGetDefaultCms());
   cparams.options.zero_tokens = true;
@@ -530,8 +539,13 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
   cparams.patches = jxl::Override::kOff;
   cparams.already_downsampled = true;
   cparams.custom_fixed_tree = tree;
-  JXL_ASSIGN_OR_RETURN(cparams.custom_splines,
-                       SplinesFromSplineData(spline_data));
+
+  std::vector<QuantizedSpline> quantized_splines;
+  std::vector<Spline::Point> starting_points;
+  JXL_RETURN_IF_ERROR(
+      SplinesFromSplineData(spline_data, quantized_splines, starting_points));
+  cparams.custom_splines = {Span<const QuantizedSpline>(quantized_splines),
+                            Span<const Spline::Point>(starting_points)};
   PaddedBytes compressed{memory_manager};
 
   JXL_RETURN_IF_ERROR(io->CheckMetadata());
@@ -539,7 +553,8 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
 
   std::unique_ptr<CodecMetadata> metadata = jxl::make_unique<CodecMetadata>();
   *metadata = io->metadata;
-  JXL_RETURN_IF_ERROR(metadata->size.Set(io->xsize(), io->ysize()));
+  JXL_RETURN_IF_ERROR(metadata->size.Set(io->xsize() * cparams.resampling,
+                                         io->ysize() * cparams.resampling));
 
   metadata->m.xyb_encoded = (cparams.color_transform == ColorTransform::kXYB);
 
@@ -579,7 +594,7 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
     cparams.manual_noise.clear();
     if (!ParseNode(tok, tree, spline_data, cparams, width, height, *io,
                    have_next, x0, y0)) {
-      return 1;
+      return JXL_FAILURE("Failed to ParseNode");
     }
     cparams.custom_fixed_tree = tree;
     JXL_ASSIGN_OR_RETURN(Image3F image,

@@ -31,6 +31,7 @@
 #include "lib/jxl/modular/encoding/dec_ma.h"
 #include "lib/jxl/modular/options.h"
 #include "lib/jxl/quant_weights.h"
+#include "lib/jxl/quantizer.h"
 #include "lib/jxl/render_pipeline/render_pipeline.h"
 
 #undef HWY_TARGET_INCLUDE
@@ -148,6 +149,14 @@ Status int_to_float(const pixel_type* const JXL_RESTRICT row_in,
     }
     int exp = (f >> mant_bits);
     int mantissa = (f & ((1 << mant_bits) - 1));
+    if (exp == (1 << exp_bits) - 1) {
+      // NaN or infinity
+      f = (signbit ? 0x80000000 : 0);
+      f |= 0b11111111 << 23;
+      f |= mantissa << mant_shift;
+      memcpy(&row_out[x], &f, 4);
+      continue;
+    }
     mantissa <<= mant_shift;
     // Try to normalize only if there is space for maneuver.
     if (exp == 0 && exp_bits < 8) {

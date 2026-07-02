@@ -5,8 +5,6 @@
 
 // Fast SIMD floating-point (I)DCT, any power of two.
 
-#include <type_traits>
-
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/status.h"
 
@@ -42,7 +40,7 @@ constexpr size_t kMaxLanes = MaxLanes(HWY_FULL(float)());
 #endif
 
 // Implementation of Lowest Complexity Self Recursive Radix-2 DCT II/III
-// Algorithms, by Siriani M. Perera and Jianhua Liu.
+// Algorithms, by Sirani M. Perera and Jianhua Liu.
 
 template <size_t N, size_t SZ>
 struct CoeffBundle {
@@ -260,8 +258,8 @@ void IDCT1DWrapper(const FromBlock& from, const ToBlock& to, size_t Mp,
 }
 
 /*    if (HWY_HAVE_SCALABLE) {
-      typedef void (*F)(const FromBlock&, const ToBlock&, size_t,
-                        float* JXL_RESTRICT);
+      using F = void (*)(const FromBlock&, const ToBlock&, size_t,
+                         float* JXL_RESTRICT);
       static F f = []() -> F {
         size_t L = Lanes(HWY_FULL(float)());
         static_assert(M <= 256, "Unsupported DCT size");
@@ -291,7 +289,7 @@ struct DCT1D {
   void operator()(const FromBlock& from, const ToBlock& to,
                   float* JXL_RESTRICT tmp) {
 #if HWY_HAVE_SCALABLE
-    typedef void (*F)(const FromBlock&, const ToBlock&, float* JXL_RESTRICT);
+    using F = void (*)(const FromBlock&, const ToBlock&, float* JXL_RESTRICT);
     static F f = []() -> F {
       size_t L = Lanes(HWY_FULL(float)());
       if (L >= 128) return DCT1DCapped<N, M, 128>::Process;
@@ -331,7 +329,7 @@ struct IDCT1D {
   void operator()(const FromBlock& from, const ToBlock& to,
                   float* JXL_RESTRICT tmp) {
 #if HWY_HAVE_SCALABLE
-    typedef void (*F)(const FromBlock&, const ToBlock&, float* JXL_RESTRICT);
+    using F = void (*)(const FromBlock&, const ToBlock&, float* JXL_RESTRICT);
     static F f = []() -> F {
       size_t L = Lanes(HWY_FULL(float)());
       if (L >= 128) return IDCT1DCapped<N, M, 128>::Process;

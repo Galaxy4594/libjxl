@@ -191,6 +191,24 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
     return val * multiplier + offset;
   };
 
+  // True iff every decision node in global_tree splits on a static property
+  // (channel or group_id) and every leaf has Gradient predictor with identity
+  // transform. When this holds, all channels collapse to a single-leaf
+  // Gradient+noop tree regardless of channel index, so the shared fl_run/fl_v
+  // RLE state remains consistent across channel calls.
+  const bool global_tree_is_all_gradient_noop = [&] {
+    for (const auto& n : global_tree) {
+      if (n.property == -1) {
+        if (n.predictor != Predictor::Gradient || n.predictor_offset != 0 ||
+            n.multiplier != 1)
+          return false;
+      } else if (n.property >= kNumStaticProperties) {
+        return false;
+      }
+    }
+    return true;
+  }();
+
   if (tree.size() == 1) {
     // special optimized case: no meta-adaptation, so no need
     // to compute properties.
@@ -234,8 +252,8 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
         }
       }
       return true;
-    } else if (uses_lz77 && predictor == Predictor::Gradient && offset == 0 &&
-               multiplier == 1 && reader->IsHuffRleOnly()) {
+    } else if (uses_lz77 && reader->IsHuffRleOnly() &&
+               global_tree_is_all_gradient_noop) {
       JXL_DEBUG_V(8, "Gradient RLE (fjxl) very fast track.");
       pixel_type_w sv = UnpackSigned(fl_v);
       for (size_t y = 0; y < channel.h; y++) {
@@ -271,7 +289,7 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
     } else if (predictor == Predictor::Gradient && offset == 0 &&
                multiplier == 1) {
       JXL_DEBUG_V(8, "Gradient very fast track.");
-      const intptr_t onerow = channel.plane.PixelsPerRow();
+      const ptrdiff_t onerow = channel.plane.PixelsPerRow();
       for (size_t y = 0; y < channel.h; y++) {
         pixel_type *JXL_RESTRICT r = channel.Row(y);
         for (size_t x = 0; x < channel.w; x++) {
@@ -299,7 +317,7 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
 
   if (is_gradient_only) {
     JXL_DEBUG_V(8, "Gradient fast track.");
-    const intptr_t onerow = channel.plane.PixelsPerRow();
+    const ptrdiff_t onerow = channel.plane.PixelsPerRow();
     for (size_t y = 0; y < channel.h; y++) {
       pixel_type *JXL_RESTRICT r = channel.Row(y);
       for (size_t x = 0; x < channel.w; x++) {
@@ -341,8 +359,8 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
             x, y, channel.w, left, left, topright, left, toptop, &properties,
             offset);
         uint32_t pos =
-            kPropRangeFast + std::min(std::max(-kPropRangeFast, properties[0]),
-                                      kPropRangeFast - 1);
+            kPropRangeFast +
+            jxl::Clamp1(properties[0], -kPropRangeFast, kPropRangeFast - 1);
         uint32_t ctx_id = tree_lut.context_lookup[pos];
         uint64_t v =
             reader->ReadHybridUintClusteredInlined<uses_lz77>(ctx_id, br);
@@ -355,8 +373,8 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
             x, y, channel.w, rtop[x], r[x - 1], rtopright[x], rtopleft[x],
             rtoptop[x], &properties, offset);
         uint32_t pos =
-            kPropRangeFast + std::min(std::max(-kPropRangeFast, properties[0]),
-                                      kPropRangeFast - 1);
+            kPropRangeFast +
+            jxl::Clamp1(properties[0], -kPropRangeFast, kPropRangeFast - 1);
         uint32_t ctx_id = tree_lut.context_lookup[pos];
         uint64_t v =
             reader->ReadHybridUintClusteredInlined<uses_lz77>(ctx_id, br);
@@ -369,8 +387,8 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
             x, y, channel.w, rtop[x], r[x - 1], rtop[x], rtopleft[x],
             rtoptop[x], &properties, offset);
         uint32_t pos =
-            kPropRangeFast + std::min(std::max(-kPropRangeFast, properties[0]),
-                                      kPropRangeFast - 1);
+            kPropRangeFast +
+            jxl::Clamp1(properties[0], -kPropRangeFast, kPropRangeFast - 1);
         uint32_t ctx_id = tree_lut.context_lookup[pos];
         uint64_t v =
             reader->ReadHybridUintClusteredInlined<uses_lz77>(ctx_id, br);
@@ -384,7 +402,7 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
     JXL_DEBUG_V(8, "Slow track.");
     MATreeLookup tree_lookup(tree);
     Properties properties = Properties(num_props);
-    const intptr_t onerow = channel.plane.PixelsPerRow();
+    const ptrdiff_t onerow = channel.plane.PixelsPerRow();
     JXL_ASSIGN_OR_RETURN(
         Channel references,
         Channel::Create(memory_manager,
@@ -433,7 +451,7 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
     JXL_DEBUG_V(8, "Slowest track.");
     MATreeLookup tree_lookup(tree);
     Properties properties = Properties(num_props);
-    const intptr_t onerow = channel.plane.PixelsPerRow();
+    const ptrdiff_t onerow = channel.plane.PixelsPerRow();
     JXL_ASSIGN_OR_RETURN(
         Channel references,
         Channel::Create(memory_manager,
@@ -671,7 +689,7 @@ Status ModularGenericDecompress(BitReader *br, Image &image,
                                 const Tree *tree, const ANSCode *code,
                                 const std::vector<uint8_t> *ctx_map,
                                 bool allow_truncated_group) {
-  std::vector<std::pair<uint32_t, uint32_t>> req_sizes;
+  std::vector<std::pair<size_t, size_t>> req_sizes;
   req_sizes.reserve(image.channel.size());
   for (const auto &c : image.channel) {
     req_sizes.emplace_back(c.w, c.h);
