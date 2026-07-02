@@ -229,16 +229,21 @@ the optional container format allows storing additional information.
 
 ## Metadata
 
-Three types of metadata can be included in a JPEG XL container:
+Multiple types of metadata can be included in a JPEG XL container:
 
 *   Exif (`Exif`)
 *   XMP (`xml `)
 *   JUMBF (`jumb`)
+*   Gain Map bundle (`jhgm`)
 
 This metadata can contain information about the image, such as copyright
 notices, GPS coordinates, camera settings, etc.
 If it contains rendering-impacting information (such as Exif orientation),
 the information in the codestream takes precedence.
+
+For Gain Maps both SDR-to-HDR and HDR-to-SDR forms are supported however
+only the latter (HDR-to-SDR) is recommended due to JPEG XL already
+having native support for HDR.
 
 ## Compressed Metadata
 
