@@ -67,14 +67,17 @@ The desired visual fidelity can be selected using the `--distance` parameter
 or using `--quality` (on a scale from 0 to 100, roughly matching libjpeg).
 The [encode effort](doc/encode_effort.md) can be selected using the `--effort` parameter.
 
-For more settings run `cjxl --help` or for a full list of options
-run `cjxl -v -v --help`.
+For more settings, run `cjxl --help`. The help output can be combined with `-v` to increase verbosity.
+Up to four `-v` flags (e.g., `cjxl -v -v -v -v --help`) reveal progressively more advanced options.
 
 To decode a JPEG XL file run:
 
 ```bash
 djxl input.jxl output.png
 ```
+
+Similar to encoding, you can run `djxl --help` to see decoding options, and pass up to two `-v` flags
+to see more advanced options.
 
 When possible, `cjxl`/`djxl` are able to read/write the following image formats:
 OpenEXR (`.exr`), GIF (`.gif`), JPEG (`.jpg`/`.jpeg`), NetPBM (`.pam`/`.pgm`/`.ppm`),

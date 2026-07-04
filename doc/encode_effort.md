@@ -38,7 +38,9 @@ For the entropy coding (context clustering, lz77 search, hybriduint configuratio
   * Efforts 8 & 9 VarDCT at distances >0.5. (hidden check in code)
 * When using `--buffering=0` (buffer entire image).
 * When using `--buffering=1` and the image is 2048x2048 or smaller.
-* When using any buffering mode, and the image has 8 or fewer total groups (e.g. smaller than 768x768).
+* When using any buffering mode, and the image has 8 or fewer total groups. The default group size is 256x256
+  (meaning this applies to images smaller than ~768x768), but this threshold dynamically scales if the group
+  size is changed via the `-g` flag in Modular mode.
 * Lossless Jpeg transcoding.
 * VarDCT at distances ≥10.
 * Lossy Modular.
