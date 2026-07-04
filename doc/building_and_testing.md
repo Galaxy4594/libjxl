@@ -4,7 +4,7 @@ This file describes the building and testing facilities provided by the `ci.sh` 
 
 ## Basic building
 
-To build the JPEG XL software and run its unit tests, run:
+To build the JPEG XL software and run its unit tests, run:
 
 ```bash
 ./ci.sh release

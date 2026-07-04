@@ -522,7 +522,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Re-licensed the project under a BSD 3-Clause license. See the
   [LICENSE](LICENSE) and [PATENTS](PATENTS) files for details.
-- Full JPEG XL part 1 specification support: Implemented all the spec required
+- Full JPEG XL part 1 specification support: Implemented all the spec required
   to decode files to pixels, including cases that are not used by the encoder
   yet. Part 2 of the spec (container format) is final but not fully implemented
   here.
@@ -619,7 +619,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- JPEG XL bitstream format is frozen. Files encoded with 0.2 will be supported
+- JPEG XL bitstream format is frozen. Files encoded with 0.2 will be supported
   by future versions.
 
 ### Changed
@@ -635,7 +635,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release of an encoder (`cjxl`) and decoder (`djxl`) that work
   together as well as a benchmark tool for comparison with other codecs
   (`benchmark_xl`).
-- Note: JPEG XL format is in the final stages of standardization, minor changes
+- Note: JPEG XL format is in the final stages of standardization, minor changes
   to the codestream format are still possible but we are not expecting any
   changes beyond what is required by bug fixing.
 - API: new decoder API in C, check the `examples/` directory for its example

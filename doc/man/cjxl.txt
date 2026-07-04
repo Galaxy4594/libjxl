@@ -5,7 +5,7 @@
 Name
 ----
 
-cjxl - compress images to JPEG XL
+cjxl - compress images to JPEG XL
 
 Synopsis
 --------
@@ -15,7 +15,7 @@ Synopsis
 Description
 -----------
 
-`cjxl` compresses an image or animation to the JPEG XL format. It is intended to
+`cjxl` compresses an image or animation to the JPEG XL format. It is intended to
 spare users the trouble of determining a set of optimal parameters for each
 individual image. Instead, for a given target quality, it should provide
 consistent visual results across various kinds of images. The defaults have been
@@ -249,7 +249,7 @@ Examples
 --------
 
 ----
-# Compress a PNG file to a high-quality JPEG XL version.
+# Compress a PNG file to a high-quality JPEG XL version.
 $ cjxl input.png output.jxl
 
 # Compress it at a slightly lower quality, appropriate for web use.

@@ -5,7 +5,7 @@
 Name
 ----
 
-djxl - decompress JPEG XL images
+djxl - decompress JPEG XL images
 
 Synopsis
 --------
@@ -15,9 +15,9 @@ Synopsis
 Description
 -----------
 
-`djxl` decompresses a JPEG XL image or animation. The output format is determined
+`djxl` decompresses a JPEG XL image or animation. The output format is determined
 by the extension of the output file, which can be `.png`, `.jpg`, `.ppm`, `.pfm`.
-If the JPEG XL input file contains an animation, multiple output files will be
+If the JPEG XL input file contains an animation, multiple output files will be
 produced, with names of the form "'output'-*framenumber*.ext".
 
 
@@ -113,7 +113,7 @@ Examples
 --------
 
 ----
-# Decompress a JPEG XL file to PNG
+# Decompress a JPEG XL file to PNG
 $ djxl input.jxl output.png
 
 # Reconstruct a losslessly-recompressed JPEG file
