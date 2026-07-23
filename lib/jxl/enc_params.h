@@ -106,6 +106,7 @@ struct CompressParams {
   // exposure for a given ISO setting on a 35mm camera.
   float photon_noise_iso = 0;
 
+  // Custom opsin matrix tuning parameters.
   float yellow_bias = -1.0f;
   float red_bias = -1.0f;
   float green_bias = -1.0f;

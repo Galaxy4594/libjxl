@@ -2008,6 +2008,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
     case JXL_ENC_FRAME_SETTING_COLOR_BOOST:
       frame_settings->values.cparams.color_boost = (value > 0.5f);
       return JxlErrorOrStatus::Success();
+
     default:
       return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_NOT_SUPPORTED,
                            "Unknown option");
@@ -2026,23 +2027,23 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetFloatOption(
       frame_settings->values.cparams.photon_noise_iso = value;
       return JxlErrorOrStatus::Success();
     case JXL_ENC_FRAME_SETTING_YELLOW_BIAS:
-      if (value < 0.0f || value > 1.0f) {
+      if (value != -1.0f && (value < 0.0f || value > 1.0f)) {
         return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_API_USAGE,
-                             "Yellow bias must be in [0.0, 1.0]");
+                             "Yellow bias must be in [0.0, 1.0] or -1.0 to disable");
       }
       frame_settings->values.cparams.yellow_bias = value;
       return JxlErrorOrStatus::Success();
     case JXL_ENC_FRAME_SETTING_RED_BIAS:
-      if (value < 0.0f || value > 1.0f) {
+      if (value != -1.0f && (value < 0.0f || value > 1.0f)) {
         return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_API_USAGE,
-                             "Red bias must be in [0.0, 1.0]");
+                             "Red bias must be in [0.0, 1.0] or -1.0 to disable");
       }
       frame_settings->values.cparams.red_bias = value;
       return JxlErrorOrStatus::Success();
     case JXL_ENC_FRAME_SETTING_GREEN_BIAS:
-      if (value < 0.0f || value > 1.0f) {
+      if (value != -1.0f && (value < 0.0f || value > 1.0f)) {
         return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_API_USAGE,
-                             "Green bias must be in [0.0, 1.0]");
+                             "Green bias must be in [0.0, 1.0] or -1.0 to disable");
       }
       frame_settings->values.cparams.green_bias = value;
       return JxlErrorOrStatus::Success();

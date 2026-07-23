@@ -412,22 +412,22 @@ struct CompressArgs {
 
     cmdline->AddOptionFlag('\0', "color_boost",
                            "Dynamically scale yellow bias based on butteraugli "
-                           "distance to boost color accuracy."
+                           "distance to boost color accuracy. "
                            "The strength scales from distance 0.3 to 3.0.",
                            &color_boost, &SetBooleanTrue, 4);
 
     cmdline->AddOptionValue('\0', "yellow_bias", "FLOAT",
-                            "Set the blue multiplier for the S-cone to tune "
-                            "the yellow bias (default 0.55).",
+                            "Set the yellow multiplier for the S-cone to tune "
+                            "the yellow bias (range [0, 1], default: disabled).",
                             &yellow_bias, &ParseFloat, 4);
 
     cmdline->AddOptionValue('\0', "red_bias", "FLOAT",
                             "Set the red multiplier for the L-cone to tune the "
-                            "red bias (default 0.3).",
+                            "red bias (range [0, 1], default: disabled).",
                             &red_bias, &ParseFloat, 4);
     cmdline->AddOptionValue('\0', "green_bias", "FLOAT",
                             "Set the green multiplier for the M-cone to tune "
-                            "the green bias (default 0.69).",
+                            "the green bias (range [0, 1], default: disabled).",
                             &green_bias, &ParseFloat, 4);
 
     cmdline->AddHelpText("\nModular mode options:", 4);
