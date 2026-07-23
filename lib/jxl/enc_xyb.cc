@@ -40,12 +40,9 @@ namespace HWY_NAMESPACE {
 
 // These templates are not found via ADL.
 using hwy::HWY_NAMESPACE::Add;
-using hwy::HWY_NAMESPACE::IfThenElse;
-using hwy::HWY_NAMESPACE::Lt;
 using hwy::HWY_NAMESPACE::Mul;
 using hwy::HWY_NAMESPACE::MulAdd;
 using hwy::HWY_NAMESPACE::Sub;
-using hwy::HWY_NAMESPACE::Zero;
 using hwy::HWY_NAMESPACE::ZeroIfNegative;
 
 // 4x3 matrix * 3x1 SIMD vectors
