@@ -110,6 +110,173 @@ static int QuantizeColorToImplicitPaletteIndex(
 
 }  // namespace palette_internal
 
+namespace {
+
+struct FastColorMap {
+  struct Entry {
+    std::vector<pixel_type> color;
+    size_t idx;
+    bool occupied = false;
+  };
+  std::vector<Entry> table;
+  size_t mask = 0;
+
+  void Init(const std::vector<std::vector<pixel_type>>& palette) {
+    size_t cap = 16;
+    while (cap < palette.size() * 3) cap <<= 1;
+    table.clear();
+    table.resize(cap);
+    mask = cap - 1;
+    for (size_t i = 0; i < palette.size(); ++i) {
+      uint64_t h = Hash(palette[i]);
+      size_t pos = h & mask;
+      while (table[pos].occupied) {
+        pos = (pos + 1) & mask;
+      }
+      table[pos].color = palette[i];
+      table[pos].idx = i;
+      table[pos].occupied = true;
+    }
+  }
+
+  inline uint64_t Hash(const std::vector<pixel_type>& c) const {
+    uint64_t h = 14695981039346656037ULL;
+    for (pixel_type v : c) {
+      h = (h ^ static_cast<uint64_t>(v)) * 1099511628211ULL;
+    }
+    return h;
+  }
+
+  inline int Find(const std::vector<pixel_type>& c) const {
+    if (table.empty()) return -1;
+    uint64_t h = Hash(c);
+    size_t pos = h & mask;
+    while (table[pos].occupied) {
+      if (table[pos].color == c) return static_cast<int>(table[pos].idx);
+      pos = (pos + 1) & mask;
+    }
+    return -1;
+  }
+};
+
+std::vector<size_t> EZengReindex(const std::vector<std::vector<uint32_t>>& matrix) {
+  size_t num_colors = matrix.size();
+  if (num_colors <= 2) {
+    std::vector<size_t> remapping(num_colors);
+    for (size_t i = 0; i < num_colors; ++i) remapping[i] = i;
+    return remapping;
+  }
+
+  size_t best_u = 0, best_v = 1;
+  uint32_t max_w = 0;
+  for (size_t i = 0; i < num_colors; i++) {
+    for (size_t j = i + 1; j < num_colors; j++) {
+      if (matrix[i][j] >= max_w) {
+        max_w = matrix[i][j];
+        best_u = i;
+        best_v = j;
+      }
+    }
+  }
+
+  std::vector<size_t> remapping = {best_u, best_v};
+
+  std::vector<std::pair<size_t, uint32_t>> sums;
+  size_t best_sum_pos = 0;
+  uint32_t best_sum_val = 0;
+  for (size_t i = 0; i < num_colors; i++) {
+    if (i == remapping[0] || i == remapping[1]) continue;
+    uint32_t sum = matrix[remapping[0]][i] + matrix[remapping[1]][i];
+    if (sum >= best_sum_val) {
+      best_sum_pos = sums.size();
+      best_sum_val = sum;
+    }
+    sums.push_back({i, sum});
+  }
+
+  while (!sums.empty()) {
+    size_t best_index = sums[best_sum_pos].first;
+    size_t m = remapping.size();
+    size_t best_pos = 0;
+    int64_t best_cost = std::numeric_limits<int64_t>::max();
+    int64_t cross_cost = 0;
+
+    for (size_t p = 0; p <= m; p++) {
+      int64_t new_cost = 0;
+      for (size_t k = 0; k < m; k++) {
+        size_t dist = (k < p) ? (p - k) : (k + 1 - p);
+        new_cost += static_cast<int64_t>(matrix[best_index][remapping[k]]) * dist;
+      }
+
+      int64_t total = new_cost + cross_cost;
+      if (total < best_cost) {
+        best_cost = total;
+        best_pos = p;
+      }
+
+      if (p < m) {
+        size_t rp = remapping[p];
+        for (size_t b = p + 1; b < m; b++) {
+          cross_cost += matrix[rp][remapping[b]];
+        }
+        for (size_t a = 0; a < p; a++) {
+          cross_cost -= matrix[remapping[a]][rp];
+        }
+      }
+    }
+    remapping.insert(remapping.begin() + best_pos, best_index);
+
+    std::swap(sums[best_sum_pos], sums.back());
+    sums.pop_back();
+
+    if (!sums.empty()) {
+      best_sum_pos = 0;
+      best_sum_val = 0;
+      for (size_t i = 0; i < sums.size(); i++) {
+        sums[i].second += matrix[best_index][sums[i].first];
+        if (sums[i].second >= best_sum_val) {
+          best_sum_pos = i;
+          best_sum_val = sums[i].second;
+        }
+      }
+    }
+  }
+
+  return remapping;
+}
+
+void PairwiseSwapSearch(std::vector<size_t>& remapping, const std::vector<std::vector<uint32_t>>& matrix, uint8_t max_dist) {
+  size_t num_colors = remapping.size();
+  size_t b_limit = static_cast<size_t>(max_dist) + 1;
+
+  int swaps = 2;
+  while (swaps >= 2) {
+    swaps = 0;
+    for (size_t a = 0; a + 1 < num_colors; a++) {
+      size_t limit = std::min(num_colors, a + b_limit);
+      for (size_t b = a + 1; b < limit; b++) {
+        size_t va = remapping[a];
+        size_t vb = remapping[b];
+        int64_t delta = 0;
+        for (size_t i = 0; i < num_colors; i++) {
+          if (i == a || i == b) continue;
+          size_t vi = remapping[i];
+          int64_t weight_diff = static_cast<int64_t>(matrix[va][vi]) - matrix[vb][vi];
+          int64_t dist_diff = std::abs(static_cast<int64_t>(b) - static_cast<int64_t>(i)) -
+                              std::abs(static_cast<int64_t>(a) - static_cast<int64_t>(i));
+          delta += weight_diff * dist_diff;
+        }
+        if (delta < 0) {
+          std::swap(remapping[a], remapping[b]);
+          swaps += 1;
+        }
+      }
+    }
+  }
+}
+
+}  // namespace
+
 int RoundInt(int value, int div) {  // symmetric rounding around 0
   if (value < 0) return -RoundInt(-value, div);
   return (value + div / 2) / div;
@@ -417,29 +584,87 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       }
     }
   }
-  // Separate the palette in two buckets, first the common colors, then the
-  // rare colors.
-  // Within each bucket, the colors are sorted on luma (times alpha).
-  float freq_threshold = 4;  // arbitrary threshold
   int clr = 0;
-  if (ordered && nb >= 3) {
-    JXL_DEBUG_V(7, "Palette of %i colors, using luma order", nb_colors);
-    // sort on luma (multiplied by alpha if available)
-    std::sort(candidate_palette_imageorder.begin(),
-              candidate_palette_imageorder.end(),
-              [&](std::vector<pixel_type> ap, std::vector<pixel_type> bp) {
-                float ay;
-                float by;
-                ay = (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
-                if (ap.size() > 3) ay *= 1.f + ap[3];
-                by = (0.299f * bp[0] + 0.587f * bp[1] + 0.114f * bp[2] + 0.1f);
-                if (bp.size() > 3) by *= 1.f + bp[3];
-                // put common colors first, transparent dark to opaque bright,
-                // then rare colors, bright to dark
-                ay = color_freq_map[ap] > freq_threshold ? -ay : ay;
-                by = color_freq_map[bp] > freq_threshold ? -by : by;
-                return ay < by;
-              });
+  if (ordered && !candidate_palette_imageorder.empty()) {
+    size_t num_colors = candidate_palette_imageorder.size();
+    size_t num_common = 0;
+    for (size_t i = 0; i < num_colors; ++i) {
+      auto it = color_freq_map.find(candidate_palette_imageorder[i]);
+      if (it != color_freq_map.end() && it->second > 4) num_common++;
+    }
+    size_t num_rare = num_colors - num_common;
+
+    // For a multi-group image dominated by rare anti-aliasing / gradient colors,
+    // partitioning common colors and ordering by luma allows subsequent group
+    // channel compaction to succeed and optimizes gradient prediction.
+    // Otherwise, EZeng + PairwiseSwap directly optimizes linear arrangement.
+    bool use_luma = (w > 256 || h > 256) && (num_rare > num_common);
+
+    if (use_luma) {
+      JXL_DEBUG_V(7, "Palette of %i colors, using luma order", nb_colors);
+      std::sort(candidate_palette_imageorder.begin(),
+                candidate_palette_imageorder.end(),
+                [&](const std::vector<pixel_type>& ap, const std::vector<pixel_type>& bp) {
+                  float ay = (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
+                  if (ap.size() > 3) ay *= 1.f + ap[3];
+                  float by = (0.299f * bp[0] + 0.587f * bp[1] + 0.114f * bp[2] + 0.1f);
+                  if (bp.size() > 3) by *= 1.f + bp[3];
+                  size_t fa = 0, fb = 0;
+                  auto ita = color_freq_map.find(ap);
+                  if (ita != color_freq_map.end()) fa = ita->second;
+                  auto itb = color_freq_map.find(bp);
+                  if (itb != color_freq_map.end()) fb = itb->second;
+                  ay = fa > 4 ? -ay : ay;
+                  by = fb > 4 ? -by : by;
+                  if (std::abs(ay - by) > 1e-4f) return ay < by;
+                  float acb = -0.1687f * ap[0] - 0.3313f * ap[1] + 0.5f * ap[2];
+                  float bcb = -0.1687f * bp[0] - 0.3313f * bp[1] + 0.5f * bp[2];
+                  return acb < bcb;
+                });
+    } else {
+      JXL_DEBUG_V(7, "Palette of %i colors, using ezeng order", nb_colors);
+      FastColorMap color_map;
+      color_map.Init(candidate_palette_imageorder);
+
+      std::vector<std::vector<uint32_t>> matrix(num_colors, std::vector<uint32_t>(num_colors, 0));
+
+      for (size_t y = 0; y < h; y++) {
+        for (uint32_t c = 0; c < nb; c++) {
+          p_in[c] = input.channel[begin_c + c].Row(y);
+        }
+        int prev_val = -1;
+        for (size_t x = 0; x < w; x++) {
+          for (uint32_t c = 0; c < nb; c++) {
+            color[c] = p_in[c][x];
+          }
+          int val = color_map.Find(color);
+          if (val != -1) {
+            if (prev_val != -1) {
+              matrix[prev_val][val]++;
+            }
+            prev_val = val;
+          } else {
+            prev_val = -1;
+          }
+        }
+      }
+
+      for (size_t i = 0; i < num_colors; i++) {
+        for (size_t j = 0; j < num_colors; j++) {
+          matrix[j][i] += matrix[i][j];
+          matrix[i][j] = matrix[j][i];
+        }
+      }
+
+      std::vector<size_t> remapping = EZengReindex(matrix);
+      PairwiseSwapSearch(remapping, matrix, 50);
+
+      std::vector<std::vector<pixel_type>> new_order(num_colors);
+      for (size_t i = 0; i < num_colors; ++i) {
+        new_order[i] = candidate_palette_imageorder[remapping[i]];
+      }
+      candidate_palette_imageorder = std::move(new_order);
+    }
   } else {
     JXL_DEBUG_V(7, "Palette of %i colors, using image order", nb_colors);
   }
