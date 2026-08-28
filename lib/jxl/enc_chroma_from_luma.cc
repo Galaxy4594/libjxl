@@ -56,6 +56,7 @@ using hwy::HWY_NAMESPACE::SumOfLanes;
 using hwy::HWY_NAMESPACE::Zero;
 
 static HWY_FULL(float) df;
+// 2D radial Contrast Sensitivity Function (CSF) weights prioritizing low-frequency AC.
 struct WeightProfile {
   float w[64];
   WeightProfile() {
@@ -273,6 +274,10 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   tile_q = num_blocks > 0 ? tile_q / num_blocks : 1.0f;
 
   auto optimize_channel_simd = [&](const float* m, const float* s, int pred, float base) {
+    if (num_ac == 0) {
+      return (std::abs(pred) <= 4) ? pred : 0;
+    }
+
     int step = 1;
     if (fast) {
       step = 8;
@@ -307,9 +312,9 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
     float dot_mm = GetLane(SumOfLanes(df, v_dot_mm));
     float dot_ss = GetLane(SumOfLanes(df, v_dot_ss));
     float sum_s = GetLane(SumOfLanes(df, v_sum_s));
-    float energy = num_ac > 0 ? (sum_s / num_ac) : 0.0f;
+    float energy = (sum_s / num_ac);
 
-    // Calculate analytical least-squares optimal target multiplier
+    // Analytical least-squares target multiplier: argmin_f sum w * (s - f*m)^2
     float target_factor = (dot_mm > 1e-6f) ? (dot_ms / dot_mm) : base;
     int target_cand = jxl::Clamp1(
         static_cast<int>(std::round((target_factor - base) * kDefaultColorFactor)),
@@ -318,59 +323,75 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                      ? (std::abs(dot_ms) / std::sqrt(dot_mm * dot_ss))
                      : 0.0f;
 
-    // Extracted SIMD inner loop that evaluates an array of candidates
+    // SIMD candidate evaluation (outer: candidate vector, inner: AC coefficients).
     auto evaluate_simd = [&](const float* eval_cands, float* eval_costs, size_t num_eval) {
       const auto oversat_penalty = Set(df, kOversatPenaltyFactor);
-      for (size_t i = 0; i < num_ac; ++i) {
-        const auto m_v = Set(df, m[i]);
-        const auto s_v = Set(df, s[i]);
-        const auto w_v = Set(df, coeffs_w[i]);
-        const auto abs_s_v = Abs(s_v);
-        
-        for (size_t c = 0; c < num_eval; c += lanes) {
-          const auto mul_v = LoadU(df, eval_cands + c);
-          const auto factor_v = Add(Set(df, base), Mul(mul_v, Set(df, 1.0f / kDefaultColorFactor)));
-          
+      const auto inv_color_factor = Set(df, 1.0f / kDefaultColorFactor);
+      const auto base_v = Set(df, base);
+
+      for (size_t c = 0; c < num_eval; c += lanes) {
+        const auto mul_v = LoadU(df, eval_cands + c);
+        const auto factor_v = Add(base_v, Mul(mul_v, inv_color_factor));
+        auto accum_v = Zero(df);
+
+        for (size_t i = 0; i < num_ac; ++i) {
+          const auto m_v = Set(df, m[i]);
+          const auto s_v = Set(df, s[i]);
+          const auto w_v = Set(df, coeffs_w[i]);
+          const auto abs_s_v = Abs(s_v);
+
           const auto res_v = Sub(s_v, Mul(factor_v, m_v));
           const auto abs_res_v = Abs(res_v);
           auto cost_v = Mul(w_v, abs_res_v);
-          
+
+          // Penalize candidates that increase residual energy over unpredicted chroma.
           const auto is_oversat = Lt(abs_s_v, abs_res_v);
           cost_v = IfThenElse(is_oversat, Mul(cost_v, oversat_penalty), cost_v);
-          
-          const auto accum_v = LoadU(df, eval_costs + c);
-          StoreU(Add(accum_v, cost_v), df, eval_costs + c);
+
+          accum_v = Add(accum_v, cost_v);
         }
+        StoreU(accum_v, df, eval_costs + c);
       }
     };
 
-    // Coarse Search Setup
+    // Coarse candidate buffer setup.
+    constexpr size_t kCandStride = 384;
     float* HWY_RESTRICT cands = scratch_space;
-    float* HWY_RESTRICT costs = cands + 256;
-    memset(costs, 0, 256 * sizeof(float));
+    float* HWY_RESTRICT costs = cands + kCandStride;
+    float* HWY_RESTRICT f_cands = costs + kCandStride;
+    float* HWY_RESTRICT f_costs = f_cands + kCandStride;
+    memset(costs, 0, kCandStride * sizeof(float));
 
     int true_num_cands = 0;
-    for (int cand = -128; cand <= 127; cand += step) cands[true_num_cands++] = cand;
+    for (int cand = -128; cand <= 127; cand += step) {
+      cands[true_num_cands++] = static_cast<float>(cand);
+    }
     
-    // Always include analytical target_cand, pred, and 0 in candidate set
-    auto add_special_cand = [&](int cand) {
+    // Seed candidate set with 0, spatial predictor, LS target, and a local neighborhood.
+    auto add_cand = [&](int cand) {
       cand = jxl::Clamp1(cand, -128, 127);
       for (int i = 0; i < true_num_cands; ++i) {
         if (static_cast<int>(cands[i]) == cand) return;
       }
-      cands[true_num_cands++] = cand;
+      cands[true_num_cands++] = static_cast<float>(cand);
     };
-    add_special_cand(target_cand);
-    add_special_cand(pred);
-    add_special_cand(0);
+    add_cand(0);
+    add_cand(pred);
+    add_cand(target_cand);
+    for (int d = -4; d <= 4; ++d) {
+      add_cand(target_cand + d);
+      add_cand(pred + d);
+    }
 
     int num_cands = true_num_cands;
-    while (num_cands % lanes != 0) { cands[num_cands] = cands[0]; costs[num_cands++] = 0; }
+    while (num_cands % lanes != 0) {
+      cands[num_cands] = cands[0];
+      costs[num_cands++] = 0.0f;
+    }
     
-    // Evaluate Coarse
     evaluate_simd(cands, costs, num_cands);
 
-    // Calculate DC chroma stats for the tile
+    // Compute tile DC chroma energy.
     const float* dc_channel = (base == 0.0f) ? dc_values_x : dc_values_b;
     float dc_sum = 0.0f;
     int dc_count = 0;
@@ -383,63 +404,76 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
     }
     float dc_avg = dc_count > 0 ? (dc_sum / dc_count) : 0.0f;
 
-    // Multi-factor deadzone refinement:
-    // 1. If luma & chroma are uncorrelated (corr < 0.20) and area is low-energy/neutral (energy < 0.10, dc_avg < 0.25),
-    //    apply a strong deadzone penalty (2.5f) to avoid injecting color noise into neutral edges.
-    // 2. If there is moderate correlation (corr < 0.35) and very low chroma energy, apply mild penalty (1.8f).
-    // 3. If there is solid correlation (corr >= 0.35) OR saturated DC chroma, allow full prediction freedom (1.0f).
+    // Apply higher deadzone penalties on neutral/low-energy tiles to suppress color noise.
+    float dc_neutral_threshold = (base == 0.0f) ? 0.10f : 0.35f;
     float deadzone_penalty = 1.0f;
-    if (corr < 0.20f && energy < 0.10f && dc_avg < 0.25f) {
+    if (corr < 0.20f && energy < 0.10f && dc_avg < dc_neutral_threshold) {
       deadzone_penalty = 2.5f;
-    } else if (corr < 0.35f && energy < 0.05f && dc_avg < 0.40f) {
+    } else if (corr < 0.35f && energy < 0.05f && dc_avg < (dc_neutral_threshold * 1.5f)) {
       deadzone_penalty = 1.8f;
     }
 
-    // Dynamic Lambda setup
+    // Approximate bit cost for modular hybrid integer residual (cand - pred).
+    auto estimate_entropy_bits = [&](int cand, int pred) {
+      int res = std::abs(cand - pred);
+      if (res == 0) return 0.8f; 
+      if (res == 1) return 2.0f;
+      return 2.5f + std::log2(static_cast<float>(res));
+    };
+
+    // Scale rate penalty by local AQ (tile_q) to allow more distortion in textured areas.
     int best_cand = 0;
     float best_cost = std::numeric_limits<float>::max();
-    float dynamic_lambda = 0.0004f * tile_q;
+    float local_lambda_bits = 0.005f * tile_q; 
+    float local_multiplier_bit_cost = kMultiplierBitCost * tile_q;
 
     for (int c = 0; c < true_num_cands; ++c) {
-      float cost = costs[c] + dynamic_lambda * std::log2(1.0f + std::abs(cands[c] - pred));
-      cost += std::abs(cands[c]) * kMultiplierBitCost * deadzone_penalty;
-      if (cost < best_cost) { best_cost = cost; best_cand = cands[c]; }
+      int cand = static_cast<int>(cands[c]);
+      float bit_cost = estimate_entropy_bits(cand, pred);
+      float cost = costs[c] + local_lambda_bits * bit_cost;
+      cost += std::abs(cand) * local_multiplier_bit_cost * deadzone_penalty;
+      if (cost < best_cost) {
+        best_cost = cost;
+        best_cand = cand;
+      }
     }
 
-    // Fine Search Setup & Evaluation
+    // Fine local search around the best coarse candidate and analytical target.
     if (step > 1) {
-      float* HWY_RESTRICT f_cands = costs + 256;
-      float* HWY_RESTRICT f_costs = f_cands + 256;
-      memset(f_costs, 0, 256 * sizeof(float));
+      memset(f_costs, 0, kCandStride * sizeof(float));
 
       int true_num_fine = 0;
-      for (int cand = best_cand - step + 1; cand < best_cand + step; ++cand) {
-        if (cand < -128 || cand > 127 || cand == best_cand) continue;
-        f_cands[true_num_fine++] = cand;
-      }
-      // Also ensure fine neighbors around analytical target_cand are evaluated
-      for (int cand = target_cand - 1; cand <= target_cand + 1; ++cand) {
-        if (cand < -128 || cand > 127 || cand == best_cand) continue;
-        bool exists = false;
+      auto add_fine_cand = [&](int cand) {
+        if (cand < -128 || cand > 127) return;
         for (int i = 0; i < true_num_fine; ++i) {
-          if (static_cast<int>(f_cands[i]) == cand) {
-            exists = true;
-            break;
-          }
+          if (static_cast<int>(f_cands[i]) == cand) return;
         }
-        if (!exists) f_cands[true_num_fine++] = cand;
+        f_cands[true_num_fine++] = static_cast<float>(cand);
+      };
+
+      for (int d = -step; d <= step; ++d) {
+        add_fine_cand(best_cand + d);
+        add_fine_cand(target_cand + d);
       }
       
       if (true_num_fine > 0) {
         int num_fine = true_num_fine;
-        while (num_fine % lanes != 0) { f_cands[num_fine] = f_cands[0]; f_costs[num_fine++] = 0; }
+        while (num_fine % lanes != 0) {
+          f_cands[num_fine] = f_cands[0];
+          f_costs[num_fine++] = 0.0f;
+        }
         
         evaluate_simd(f_cands, f_costs, num_fine);
         
         for (int c = 0; c < true_num_fine; ++c) {
-          float cost = f_costs[c] + dynamic_lambda * std::log2(1.0f + std::abs(f_cands[c] - pred));
-          cost += std::abs(f_cands[c]) * kMultiplierBitCost * deadzone_penalty;
-          if (cost < best_cost) { best_cost = cost; best_cand = f_cands[c]; }
+          int cand = static_cast<int>(f_cands[c]);
+          float bit_cost = estimate_entropy_bits(cand, pred);
+          float cost = f_costs[c] + local_lambda_bits * bit_cost;
+          cost += std::abs(cand) * local_multiplier_bit_cost * deadzone_penalty;
+          if (cost < best_cost) {
+            best_cost = cost;
+            best_cand = cand;
+          }
         }
       }
     }
