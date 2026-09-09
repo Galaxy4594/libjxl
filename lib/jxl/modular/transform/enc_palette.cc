@@ -39,8 +39,8 @@ static constexpr bool kEncodeToHighQualityImplicitPalette = true;
 // Inclusive.
 static constexpr int kMinImplicitPaletteIndex = -(2 * 72 - 1);
 
-float ColorDistance(const std::vector<float> &JXL_RESTRICT a,
-                    const std::vector<pixel_type> &JXL_RESTRICT b) {
+float ColorDistance(const std::vector<float>& JXL_RESTRICT a,
+                    const std::vector<pixel_type>& JXL_RESTRICT b) {
   JXL_DASSERT(a.size() == b.size());
   float distance = 0;
   float ave3 = 0;
@@ -76,7 +76,7 @@ float ColorDistance(const std::vector<float> &JXL_RESTRICT a,
 }
 
 static int QuantizeColorToImplicitPaletteIndex(
-    const std::vector<pixel_type> &color, const int palette_size,
+    const std::vector<pixel_type>& color, const int palette_size,
     const int bit_depth, bool high_quality) {
   int index = 0;
   int quant = (1 << bit_depth) - 1;
@@ -159,7 +159,25 @@ struct FastColorMap {
   }
 };
 
-std::vector<size_t> EZengReindex(const std::vector<std::vector<uint32_t>>& matrix) {
+int64_t ComputeOLACost(const std::vector<size_t>& remapping,
+                       const std::vector<std::vector<uint32_t>>& matrix) {
+  size_t n = remapping.size();
+  int64_t total = 0;
+  for (size_t i = 0; i < n; i++) {
+    size_t vi = remapping[i];
+    for (size_t j = i + 1; j < n; j++) {
+      size_t vj = remapping[j];
+      if (matrix[vi][vj] > 0) {
+        total += static_cast<int64_t>(matrix[vi][vj]) * (j - i);
+      }
+    }
+  }
+  return total;
+}
+
+std::vector<size_t> EZengReindexWithSeed(
+    const std::vector<std::vector<uint32_t>>& matrix, size_t seed_u,
+    size_t seed_v) {
   size_t num_colors = matrix.size();
   if (num_colors <= 2) {
     std::vector<size_t> remapping(num_colors);
@@ -167,19 +185,7 @@ std::vector<size_t> EZengReindex(const std::vector<std::vector<uint32_t>>& matri
     return remapping;
   }
 
-  size_t best_u = 0, best_v = 1;
-  uint32_t max_w = 0;
-  for (size_t i = 0; i < num_colors; i++) {
-    for (size_t j = i + 1; j < num_colors; j++) {
-      if (matrix[i][j] >= max_w) {
-        max_w = matrix[i][j];
-        best_u = i;
-        best_v = j;
-      }
-    }
-  }
-
-  std::vector<size_t> remapping = {best_u, best_v};
+  std::vector<size_t> remapping = {seed_u, seed_v};
 
   std::vector<std::pair<size_t, uint32_t>> sums;
   size_t best_sum_pos = 0;
@@ -205,7 +211,8 @@ std::vector<size_t> EZengReindex(const std::vector<std::vector<uint32_t>>& matri
       int64_t new_cost = 0;
       for (size_t k = 0; k < m; k++) {
         size_t dist = (k < p) ? (p - k) : (k + 1 - p);
-        new_cost += static_cast<int64_t>(matrix[best_index][remapping[k]]) * dist;
+        new_cost +=
+            static_cast<int64_t>(matrix[best_index][remapping[k]]) * dist;
       }
 
       int64_t total = new_cost + cross_cost;
@@ -245,13 +252,42 @@ std::vector<size_t> EZengReindex(const std::vector<std::vector<uint32_t>>& matri
   return remapping;
 }
 
-void PairwiseSwapSearch(std::vector<size_t>& remapping, const std::vector<std::vector<uint32_t>>& matrix, uint8_t max_dist) {
-  size_t num_colors = remapping.size();
-  size_t b_limit = static_cast<size_t>(max_dist) + 1;
+std::vector<size_t> EZengReindex(
+    const std::vector<std::vector<uint32_t>>& matrix) {
+  size_t num_colors = matrix.size();
+  if (num_colors <= 2) {
+    std::vector<size_t> remapping(num_colors);
+    for (size_t i = 0; i < num_colors; ++i) remapping[i] = i;
+    return remapping;
+  }
 
-  int swaps = 2;
-  while (swaps >= 2) {
+  size_t best_u = 0, best_v = 1;
+  uint32_t max_w = 0;
+  for (size_t i = 0; i < num_colors; i++) {
+    for (size_t j = i + 1; j < num_colors; j++) {
+      if (matrix[i][j] >= max_w) {
+        max_w = matrix[i][j];
+        best_u = i;
+        best_v = j;
+      }
+    }
+  }
+
+  return EZengReindexWithSeed(matrix, best_u, best_v);
+}
+
+void PairwiseSwapSearch(std::vector<size_t>& remapping,
+                        const std::vector<std::vector<uint32_t>>& matrix,
+                        uint8_t max_dist) {
+  size_t num_colors = remapping.size();
+  size_t b_limit =
+      (max_dist == 0) ? num_colors : (static_cast<size_t>(max_dist) + 1);
+
+  int swaps = 1;
+  int iter = 0;
+  while (swaps > 0 && iter < 50) {
     swaps = 0;
+    iter++;
     for (size_t a = 0; a + 1 < num_colors; a++) {
       size_t limit = std::min(num_colors, a + b_limit);
       for (size_t b = a + 1; b < limit; b++) {
@@ -261,9 +297,11 @@ void PairwiseSwapSearch(std::vector<size_t>& remapping, const std::vector<std::v
         for (size_t i = 0; i < num_colors; i++) {
           if (i == a || i == b) continue;
           size_t vi = remapping[i];
-          int64_t weight_diff = static_cast<int64_t>(matrix[va][vi]) - matrix[vb][vi];
-          int64_t dist_diff = std::abs(static_cast<int64_t>(b) - static_cast<int64_t>(i)) -
-                              std::abs(static_cast<int64_t>(a) - static_cast<int64_t>(i));
+          int64_t weight_diff =
+              static_cast<int64_t>(matrix[va][vi]) - matrix[vb][vi];
+          int64_t dist_diff =
+              std::abs(static_cast<int64_t>(b) - static_cast<int64_t>(i)) -
+              std::abs(static_cast<int64_t>(a) - static_cast<int64_t>(i));
           delta += weight_diff * dist_diff;
         }
         if (delta < 0) {
@@ -272,6 +310,59 @@ void PairwiseSwapSearch(std::vector<size_t>& remapping, const std::vector<std::v
         }
       }
     }
+  }
+}
+
+void TwoOptSearch(std::vector<size_t>& remapping,
+                  const std::vector<std::vector<uint32_t>>& matrix) {
+  size_t n = remapping.size();
+  bool improved = true;
+  int iter = 0;
+  while (improved && iter < 10) {
+    improved = false;
+    iter++;
+    for (size_t a = 0; a + 1 < n; a++) {
+      size_t b_limit = std::min(n, a + 33);
+      for (size_t b = a + 1; b < b_limit; b++) {
+        int64_t delta = 0;
+        for (size_t k = a; k <= b; k++) {
+          size_t vk = remapping[k];
+          int64_t old_pos = static_cast<int64_t>(k);
+          int64_t new_pos = static_cast<int64_t>(a + b - k);
+          if (old_pos == new_pos) continue;
+          for (size_t i = 0; i < n; i++) {
+            if (i >= a && i <= b) continue;
+            uint32_t w = matrix[vk][remapping[i]];
+            if (w > 0) {
+              int64_t pos_i = static_cast<int64_t>(i);
+              int64_t old_d = std::abs(old_pos - pos_i);
+              int64_t new_d = std::abs(new_pos - pos_i);
+              delta += static_cast<int64_t>(w) * (new_d - old_d);
+            }
+          }
+        }
+        if (delta < 0) {
+          std::reverse(remapping.begin() + a, remapping.begin() + b + 1);
+          improved = true;
+        }
+      }
+    }
+  }
+}
+
+void OrientRemapping(
+    std::vector<size_t>& remapping,
+    const std::vector<std::vector<pixel_type>>& palette,
+    const std::map<std::vector<pixel_type>, size_t>& color_freq_map) {
+  if (remapping.size() <= 2) return;
+  size_t f_front = 0;
+  size_t f_back = 0;
+  auto it_f = color_freq_map.find(palette[remapping.front()]);
+  if (it_f != color_freq_map.end()) f_front = it_f->second;
+  auto it_b = color_freq_map.find(palette[remapping.back()]);
+  if (it_b != color_freq_map.end()) f_back = it_b->second;
+  if (f_back > f_front) {
+    std::reverse(remapping.begin(), remapping.end());
   }
 }
 
@@ -308,7 +399,7 @@ struct PaletteIterationData {
     const float delta_distance_multiplier = 1.0f / num_pixels;
 
     // Weigh frequencies by magnitude and normalize.
-    for (auto &delta_frequency : delta_frequency_map) {
+    for (auto& delta_frequency : delta_frequency_map) {
       std::vector<pixel_type> current_delta = {delta_frequency.first[0],
                                                delta_frequency.first[1],
                                                delta_frequency.first[2]};
@@ -325,12 +416,12 @@ struct PaletteIterationData {
         delta_frequency_map.begin(), delta_frequency_map.end());
     std::sort(
         sorted_delta_frequency_map.begin(), sorted_delta_frequency_map.end(),
-        [](const pixel_type_3d_frequency &a, const pixel_type_3d_frequency &b) {
+        [](const pixel_type_3d_frequency& a, const pixel_type_3d_frequency& b) {
           return a.second > b.second;
         });
 
     // Store the top deltas.
-    for (auto &delta_frequency : sorted_delta_frequency_map) {
+    for (auto& delta_frequency : sorted_delta_frequency_map) {
       if (frequent_deltas[0].size() >= kMaxDeltas) break;
       // Number obtained by optimizing on jyrki31 corpus:
       if (delta_frequency.second < 17) break;
@@ -341,14 +432,14 @@ struct PaletteIterationData {
   }
 };
 
-Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
-                           uint32_t &nb_colors, uint32_t &nb_deltas,
-                           bool ordered, bool lossy, Predictor &predictor,
-                           const weighted::Header &wp_header,
-                           PaletteIterationData &palette_iteration_data) {
+Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
+                           uint32_t& nb_colors, uint32_t& nb_deltas,
+                           bool ordered, bool lossy, Predictor& predictor,
+                           const weighted::Header& wp_header,
+                           PaletteIterationData& palette_iteration_data) {
   JXL_QUIET_RETURN_IF_ERROR(CheckEqualChannels(input, begin_c, end_c));
   JXL_ENSURE(begin_c >= input.nb_meta_channels);
-  JxlMemoryManager *memory_manager = input.memory_manager();
+  JxlMemoryManager* memory_manager = input.memory_manager();
   uint32_t nb = end_c - begin_c + 1;
 
   size_t w = input.channel[begin_c].w;
@@ -371,7 +462,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       std::set<pixel_type> chpalette;
       pixel_type idx = 0;
       for (size_t y = 0; y < h; y++) {
-        const pixel_type *p = input.channel[begin_c].Row(y);
+        const pixel_type* p = input.channel[begin_c].Row(y);
         for (size_t x = 0; x < w; x++) {
           const bool new_color = chpalette.insert(p[x]).second;
           if (new_color) {
@@ -387,12 +478,12 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       pch.vshift = -1;
       nb_colors = idx;
       idx = 0;
-      pixel_type *JXL_RESTRICT p_palette = pch.Row(0);
+      pixel_type* JXL_RESTRICT p_palette = pch.Row(0);
       for (pixel_type p : chpalette) {
         p_palette[idx++] = p;
       }
       for (size_t y = 0; y < h; y++) {
-        pixel_type *p = input.channel[begin_c].Row(y);
+        pixel_type* p = input.channel[begin_c].Row(y);
         for (size_t x = 0; x < w; x++) {
           for (idx = 0;
                p[x] != p_palette[idx] && idx < static_cast<int>(nb_colors);
@@ -412,7 +503,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     lookup.resize(lookup_table_size, 0);
     pixel_type idx = 0;
     for (size_t y = 0; y < h; y++) {
-      const pixel_type *p = input.channel[begin_c].Row(y);
+      const pixel_type* p = input.channel[begin_c].Row(y);
       for (size_t x = 0; x < w; x++) {
         if (lookup[p[x] - minval] == 0) {
           lookup[p[x] - minval] = 1;
@@ -427,7 +518,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     pch.vshift = -1;
     nb_colors = idx;
     idx = 0;
-    pixel_type *JXL_RESTRICT p_palette = pch.Row(0);
+    pixel_type* JXL_RESTRICT p_palette = pch.Row(0);
     for (size_t i = 0; i < lookup_table_size; i++) {
       if (lookup[i]) {
         p_palette[idx] = i + minval;
@@ -436,7 +527,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       }
     }
     for (size_t y = 0; y < h; y++) {
-      pixel_type *p = input.channel[begin_c].Row(y);
+      pixel_type* p = input.channel[begin_c].Row(y);
       for (size_t x = 0; x < w; x++) p[x] = lookup[p[x] - minval];
     }
     predictor = Predictor::Zero;
@@ -464,7 +555,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
   std::vector<std::vector<pixel_type>> candidate_palette_imageorder;
   std::vector<pixel_type> color(nb);
   std::vector<float> color_with_error(nb);
-  std::vector<const pixel_type *> p_in(nb);
+  std::vector<const pixel_type*> p_in(nb);
   std::map<std::vector<pixel_type>, size_t> inv_palette;
 
   if (lossy) {
@@ -498,7 +589,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     // Add colors satisfying frequency condition to the palette.
     constexpr float kImageFraction = 0.01f;
     size_t color_frequency_lower_bound = 5 + input.h * input.w * kImageFraction;
-    for (const auto &color_freq : color_freq_map) {
+    for (const auto& color_freq : color_freq_map) {
       if (color_freq.second > color_frequency_lower_bound) {
         candidate_palette.insert(color_freq.first);
         candidate_palette_imageorder.push_back(color_freq.first);
@@ -571,7 +662,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
                        Channel::Create(memory_manager, nb_colors, nb));
   pch.hshift = -1;
   pch.vshift = -1;
-  pixel_type *JXL_RESTRICT p_palette = pch.Row(0);
+  pixel_type* JXL_RESTRICT p_palette = pch.Row(0);
   ptrdiff_t onerow = pch.plane.PixelsPerRow();
   ptrdiff_t onerow_image = input.channel[begin_c].plane.PixelsPerRow();
   const int bit_depth = std::min(input.bitdepth, 24);
@@ -594,20 +685,102 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     }
     size_t num_rare = num_colors - num_common;
 
-    // For a multi-group image dominated by rare anti-aliasing / gradient colors,
-    // partitioning common colors and ordering by luma allows subsequent group
-    // channel compaction to succeed and optimizes gradient prediction.
-    // Otherwise, EZeng + PairwiseSwap directly optimizes linear arrangement.
-    bool use_luma = (w > 256 || h > 256) && (num_rare > num_common);
+    // For images dominated by rare anti-aliasing / gradient colors (e.g.
+    // radiation.png, image-subsampling-test.png), partitioning common colors
+    // and ordering by luma allows subsequent group channel compaction to
+    // succeed and optimizes gradient prediction. Otherwise (e.g. distinct
+    // illustrations like hero1.png, icons, pixel art), EZeng + PairwiseSwap
+    // directly optimizes linear arrangement across color boundaries.
+    FastColorMap color_map;
+    color_map.Init(candidate_palette_imageorder);
+
+    std::vector<std::vector<uint32_t>> matrix(
+        num_colors, std::vector<uint32_t>(num_colors, 0));
+    std::vector<int> prev_row(w, -1);
+
+    for (size_t y = 0; y < h; y++) {
+      for (uint32_t c = 0; c < nb; c++) {
+        p_in[c] = input.channel[begin_c + c].Row(y);
+      }
+      int prev_val = -1;
+      for (size_t x = 0; x < w; x++) {
+        for (uint32_t c = 0; c < nb; c++) {
+          color[c] = p_in[c][x];
+        }
+        int val = color_map.Find(color);
+        if (val != -1) {
+          if (prev_val != -1) {
+            matrix[prev_val][val]++;
+          }
+          if (prev_row[x] != -1) {
+            matrix[prev_row[x]][val]++;
+          }
+          prev_val = val;
+          prev_row[x] = val;
+        } else {
+          prev_val = -1;
+          prev_row[x] = -1;
+        }
+      }
+    }
+
+    for (size_t i = 0; i < num_colors; i++) {
+      for (size_t j = 0; j < num_colors; j++) {
+        matrix[j][i] += matrix[i][j];
+        matrix[i][j] = matrix[j][i];
+      }
+    }
+
+    uint64_t total_trans = 0;
+    uint64_t high_contrast_trans = 0;
+    for (size_t i = 0; i < num_colors; i++) {
+      float y1 = 0.299f * candidate_palette_imageorder[i][0] +
+                 0.587f * candidate_palette_imageorder[i][1] +
+                 0.114f * candidate_palette_imageorder[i][2];
+      for (size_t j = i + 1; j < num_colors; j++) {
+        if (matrix[i][j] > 0) {
+          total_trans += matrix[i][j];
+          float y2 = 0.299f * candidate_palette_imageorder[j][0] +
+                     0.587f * candidate_palette_imageorder[j][1] +
+                     0.114f * candidate_palette_imageorder[j][2];
+          if (std::abs(y1 - y2) > 100.0f) {
+            high_contrast_trans += matrix[i][j];
+          }
+        }
+      }
+    }
+
+    bool use_luma = false;
+    if (w > 256 || h > 256) {
+      // For multi-group images, if the global palette is dominated by rare
+      // anti-aliasing or gradient colors (e.g. radiation.png with patches),
+      // sorting common colors by descending luma and rare colors by ascending
+      // luma clusters dominant background colors near index 0. This enables
+      // subsequent group-level channel compaction to succeed and optimizes
+      // gradient prediction.
+      use_luma = (num_rare > num_common);
+    } else {
+      // For small images (e.g. image-subsampling-test.png) or group-level
+      // tiles, use luma sort if the image is dominated by smooth gradients (low
+      // contrast transitions <= 40% of total) and rare colors. If sharp,
+      // high-contrast edges dominate (e.g. group tiles of radiation.png), EZeng
+      // + PairwiseSwap directly optimizes linear arrangement across color
+      // boundaries.
+      use_luma = (num_rare > num_common) &&
+                 (high_contrast_trans * 5 <= total_trans * 2);
+    }
 
     if (use_luma) {
       JXL_DEBUG_V(7, "Palette of %i colors, using luma order", nb_colors);
       std::sort(candidate_palette_imageorder.begin(),
                 candidate_palette_imageorder.end(),
-                [&](const std::vector<pixel_type>& ap, const std::vector<pixel_type>& bp) {
-                  float ay = (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
+                [&](const std::vector<pixel_type>& ap,
+                    const std::vector<pixel_type>& bp) {
+                  float ay =
+                      (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
                   if (ap.size() > 3) ay *= 1.f + ap[3];
-                  float by = (0.299f * bp[0] + 0.587f * bp[1] + 0.114f * bp[2] + 0.1f);
+                  float by =
+                      (0.299f * bp[0] + 0.587f * bp[1] + 0.114f * bp[2] + 0.1f);
                   if (bp.size() > 3) by *= 1.f + bp[3];
                   size_t fa = 0, fb = 0;
                   auto ita = color_freq_map.find(ap);
@@ -623,41 +796,11 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
                 });
     } else {
       JXL_DEBUG_V(7, "Palette of %i colors, using ezeng order", nb_colors);
-      FastColorMap color_map;
-      color_map.Init(candidate_palette_imageorder);
-
-      std::vector<std::vector<uint32_t>> matrix(num_colors, std::vector<uint32_t>(num_colors, 0));
-
-      for (size_t y = 0; y < h; y++) {
-        for (uint32_t c = 0; c < nb; c++) {
-          p_in[c] = input.channel[begin_c + c].Row(y);
-        }
-        int prev_val = -1;
-        for (size_t x = 0; x < w; x++) {
-          for (uint32_t c = 0; c < nb; c++) {
-            color[c] = p_in[c][x];
-          }
-          int val = color_map.Find(color);
-          if (val != -1) {
-            if (prev_val != -1) {
-              matrix[prev_val][val]++;
-            }
-            prev_val = val;
-          } else {
-            prev_val = -1;
-          }
-        }
-      }
-
-      for (size_t i = 0; i < num_colors; i++) {
-        for (size_t j = 0; j < num_colors; j++) {
-          matrix[j][i] += matrix[i][j];
-          matrix[i][j] = matrix[j][i];
-        }
-      }
 
       std::vector<size_t> remapping = EZengReindex(matrix);
       PairwiseSwapSearch(remapping, matrix, 50);
+      TwoOptSearch(remapping, matrix);
+      OrientRemapping(remapping, candidate_palette_imageorder, color_freq_map);
 
       std::vector<std::vector<pixel_type>> new_order(num_colors);
       for (size_t i = 0; i < num_colors; ++i) {
@@ -682,13 +825,13 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
   for (size_t c = 0; c < nb; c++) {
     wp_states.emplace_back(wp_header, w, h);
   }
-  std::vector<pixel_type *> p_quant(nb);
+  std::vector<pixel_type*> p_quant(nb);
   // Three rows of error for dithering: y to y + 2.
   // Each row has two pixels of padding in the ends, which is
   // beneficial for both precision and encoding speed.
   std::vector<std::vector<float>> error_row[3];
   if (lossy) {
-    for (auto &row : error_row) {
+    for (auto& row : error_row) {
       row.resize(nb);
       for (size_t c = 0; c < nb; ++c) {
         row[c].resize(w + 4);
@@ -700,7 +843,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       p_in[c] = input.channel[begin_c + c].Row(y);
       if (lossy) p_quant[c] = quantized_input.channel[c].Row(y);
     }
-    pixel_type *JXL_RESTRICT p = input.channel[begin_c].Row(y);
+    pixel_type* JXL_RESTRICT p = input.channel[begin_c].Row(y);
     for (size_t x = 0; x < w; x++) {
       int index;
       if (!lossy) {
@@ -869,10 +1012,10 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
   return true;
 }
 
-Status FwdPalette(Image &input, uint32_t begin_c, uint32_t end_c,
-                  uint32_t &nb_colors, uint32_t &nb_deltas, bool ordered,
-                  bool lossy, Predictor &predictor,
-                  const weighted::Header &wp_header) {
+Status FwdPalette(Image& input, uint32_t begin_c, uint32_t end_c,
+                  uint32_t& nb_colors, uint32_t& nb_deltas, bool ordered,
+                  bool lossy, Predictor& predictor,
+                  const weighted::Header& wp_header) {
   PaletteIterationData palette_iteration_data;
   uint32_t nb_colors_orig = nb_colors;
   uint32_t nb_deltas_orig = nb_deltas;
