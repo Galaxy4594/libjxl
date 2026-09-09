@@ -56,21 +56,22 @@ class Transform : public Fields {
   // for Palette, not serialized.
   bool ordered_palette = true;
   bool lossy_palette = false;
+  bool zero_predictor_mode = false;
 
   explicit Transform(TransformId id);
   // default constructor for bundles.
   Transform();
 
-  Status VisitFields(Visitor *JXL_RESTRICT visitor) override;
+  Status VisitFields(Visitor* JXL_RESTRICT visitor) override;
 
   JXL_FIELDS_NAME(Transform)
 
-  Status Inverse(Image &input, const weighted::Header &wp_header,
-                 ThreadPool *pool = nullptr) const;
-  Status MetaApply(Image &input);
+  Status Inverse(Image& input, const weighted::Header& wp_header,
+                 ThreadPool* pool = nullptr) const;
+  Status MetaApply(Image& input);
 };
 
-Status CheckEqualChannels(const Image &image, uint32_t c1, uint32_t c2);
+Status CheckEqualChannels(const Image& image, uint32_t c1, uint32_t c2);
 
 static inline pixel_type PixelAdd(pixel_type a, pixel_type b) {
   return static_cast<pixel_type>(static_cast<uint32_t>(a) +

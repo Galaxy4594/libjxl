@@ -436,7 +436,8 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
                            uint32_t& nb_colors, uint32_t& nb_deltas,
                            bool ordered, bool lossy, Predictor& predictor,
                            const weighted::Header& wp_header,
-                           PaletteIterationData& palette_iteration_data) {
+                           PaletteIterationData& palette_iteration_data,
+                           bool zero_predictor_mode = false) {
   JXL_QUIET_RETURN_IF_ERROR(CheckEqualChannels(input, begin_c, end_c));
   JXL_ENSURE(begin_c >= input.nb_meta_channels);
   JxlMemoryManager* memory_manager = input.memory_manager();
@@ -677,136 +678,135 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
   }
   int clr = 0;
   if (ordered && !candidate_palette_imageorder.empty()) {
-    size_t num_colors = candidate_palette_imageorder.size();
-    size_t num_common = 0;
-    for (size_t i = 0; i < num_colors; ++i) {
-      auto it = color_freq_map.find(candidate_palette_imageorder[i]);
-      if (it != color_freq_map.end() && it->second > 4) num_common++;
-    }
-    size_t num_rare = num_colors - num_common;
-
-    // For images dominated by rare anti-aliasing / gradient colors (e.g.
-    // radiation.png, image-subsampling-test.png), partitioning common colors
-    // and ordering by luma allows subsequent group channel compaction to
-    // succeed and optimizes gradient prediction. Otherwise (e.g. distinct
-    // illustrations like hero1.png, icons, pixel art), EZeng + PairwiseSwap
-    // directly optimizes linear arrangement across color boundaries.
-    FastColorMap color_map;
-    color_map.Init(candidate_palette_imageorder);
-
-    std::vector<std::vector<uint32_t>> matrix(
-        num_colors, std::vector<uint32_t>(num_colors, 0));
-    std::vector<int> prev_row(w, -1);
-
-    for (size_t y = 0; y < h; y++) {
-      for (uint32_t c = 0; c < nb; c++) {
-        p_in[c] = input.channel[begin_c + c].Row(y);
-      }
-      int prev_val = -1;
-      for (size_t x = 0; x < w; x++) {
-        for (uint32_t c = 0; c < nb; c++) {
-          color[c] = p_in[c][x];
-        }
-        int val = color_map.Find(color);
-        if (val != -1) {
-          if (prev_val != -1) {
-            matrix[prev_val][val]++;
-          }
-          if (prev_row[x] != -1) {
-            matrix[prev_row[x]][val]++;
-          }
-          prev_val = val;
-          prev_row[x] = val;
-        } else {
-          prev_val = -1;
-          prev_row[x] = -1;
-        }
-      }
-    }
-
-    for (size_t i = 0; i < num_colors; i++) {
-      for (size_t j = 0; j < num_colors; j++) {
-        matrix[j][i] += matrix[i][j];
-        matrix[i][j] = matrix[j][i];
-      }
-    }
-
-    uint64_t total_trans = 0;
-    uint64_t high_contrast_trans = 0;
-    for (size_t i = 0; i < num_colors; i++) {
-      float y1 = 0.299f * candidate_palette_imageorder[i][0] +
-                 0.587f * candidate_palette_imageorder[i][1] +
-                 0.114f * candidate_palette_imageorder[i][2];
-      for (size_t j = i + 1; j < num_colors; j++) {
-        if (matrix[i][j] > 0) {
-          total_trans += matrix[i][j];
-          float y2 = 0.299f * candidate_palette_imageorder[j][0] +
-                     0.587f * candidate_palette_imageorder[j][1] +
-                     0.114f * candidate_palette_imageorder[j][2];
-          if (std::abs(y1 - y2) > 100.0f) {
-            high_contrast_trans += matrix[i][j];
-          }
-        }
-      }
-    }
-
-    bool use_luma = false;
-    if (w > 256 || h > 256) {
-      // For multi-group images, if the global palette is dominated by rare
-      // anti-aliasing or gradient colors (e.g. radiation.png with patches),
-      // sorting common colors by descending luma and rare colors by ascending
-      // luma clusters dominant background colors near index 0. This enables
-      // subsequent group-level channel compaction to succeed and optimizes
-      // gradient prediction.
-      use_luma = (num_rare > num_common);
-    } else {
-      // For small images (e.g. image-subsampling-test.png) or group-level
-      // tiles, use luma sort if the image is dominated by smooth gradients (low
-      // contrast transitions <= 40% of total) and rare colors. If sharp,
-      // high-contrast edges dominate (e.g. group tiles of radiation.png), EZeng
-      // + PairwiseSwap directly optimizes linear arrangement across color
-      // boundaries.
-      use_luma = (num_rare > num_common) &&
-                 (high_contrast_trans * 5 <= total_trans * 2);
-    }
-
-    if (use_luma) {
-      JXL_DEBUG_V(7, "Palette of %i colors, using luma order", nb_colors);
+    if (zero_predictor_mode) {
+      JXL_DEBUG_V(7,
+                  "Palette of %i colors, using lexicographic order (zero "
+                  "predictor / LZ77 mode)",
+                  nb_colors);
       std::sort(candidate_palette_imageorder.begin(),
-                candidate_palette_imageorder.end(),
-                [&](const std::vector<pixel_type>& ap,
-                    const std::vector<pixel_type>& bp) {
-                  float ay =
-                      (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
-                  if (ap.size() > 3) ay *= 1.f + ap[3];
-                  float by =
-                      (0.299f * bp[0] + 0.587f * bp[1] + 0.114f * bp[2] + 0.1f);
-                  if (bp.size() > 3) by *= 1.f + bp[3];
-                  size_t fa = 0, fb = 0;
-                  auto ita = color_freq_map.find(ap);
-                  if (ita != color_freq_map.end()) fa = ita->second;
-                  auto itb = color_freq_map.find(bp);
-                  if (itb != color_freq_map.end()) fb = itb->second;
-                  ay = fa > 4 ? -ay : ay;
-                  by = fb > 4 ? -by : by;
-                  if (std::abs(ay - by) > 1e-4f) return ay < by;
-                  float acb = -0.1687f * ap[0] - 0.3313f * ap[1] + 0.5f * ap[2];
-                  float bcb = -0.1687f * bp[0] - 0.3313f * bp[1] + 0.5f * bp[2];
-                  return acb < bcb;
-                });
+                candidate_palette_imageorder.end());
     } else {
-      JXL_DEBUG_V(7, "Palette of %i colors, using ezeng order", nb_colors);
-
-      std::vector<size_t> remapping = EZengReindex(matrix);
-      PairwiseSwapSearch(remapping, matrix, 50);
-      TwoOptSearch(remapping, matrix);
-      OrientRemapping(remapping, candidate_palette_imageorder, color_freq_map);
-
-      std::vector<std::vector<pixel_type>> new_order(num_colors);
+      size_t num_colors = candidate_palette_imageorder.size();
+      size_t num_common = 0;
       for (size_t i = 0; i < num_colors; ++i) {
-        new_order[i] = candidate_palette_imageorder[remapping[i]];
+        auto it = color_freq_map.find(candidate_palette_imageorder[i]);
+        if (it != color_freq_map.end() && it->second > 4) num_common++;
       }
-      candidate_palette_imageorder = std::move(new_order);
+      size_t num_rare = num_colors - num_common;
+
+      // For images dominated by rare anti-aliasing / gradient colors (e.g.
+      // radiation.png, image-subsampling-test.png), partitioning common colors
+      // and ordering by luma allows subsequent group channel compaction to
+      // succeed and optimizes gradient prediction. Otherwise (e.g. distinct
+      // illustrations like hero1.png, icons, pixel art), EZeng + PairwiseSwap
+      // directly optimizes linear arrangement across color boundaries.
+      FastColorMap color_map;
+      color_map.Init(candidate_palette_imageorder);
+
+      std::vector<std::vector<uint32_t>> matrix(
+          num_colors, std::vector<uint32_t>(num_colors, 0));
+      std::vector<int> prev_row(w, -1);
+
+      for (size_t y = 0; y < h; y++) {
+        for (uint32_t c = 0; c < nb; c++) {
+          p_in[c] = input.channel[begin_c + c].Row(y);
+        }
+        int prev_val = -1;
+        for (size_t x = 0; x < w; x++) {
+          for (uint32_t c = 0; c < nb; c++) {
+            color[c] = p_in[c][x];
+          }
+          int val = color_map.Find(color);
+          if (val != -1) {
+            if (prev_val != -1) {
+              matrix[prev_val][val]++;
+            }
+            if (prev_row[x] != -1) {
+              matrix[prev_row[x]][val]++;
+            }
+            prev_val = val;
+            prev_row[x] = val;
+          } else {
+            prev_val = -1;
+            prev_row[x] = -1;
+          }
+        }
+      }
+
+      for (size_t i = 0; i < num_colors; i++) {
+        for (size_t j = 0; j < num_colors; j++) {
+          matrix[j][i] += matrix[i][j];
+          matrix[i][j] = matrix[j][i];
+        }
+      }
+
+      uint64_t total_trans = 0;
+      uint64_t high_contrast_trans = 0;
+      for (size_t i = 0; i < num_colors; i++) {
+        float y1 = 0.299f * candidate_palette_imageorder[i][0] +
+                   0.587f * candidate_palette_imageorder[i][1] +
+                   0.114f * candidate_palette_imageorder[i][2];
+        for (size_t j = i + 1; j < num_colors; j++) {
+          if (matrix[i][j] > 0) {
+            total_trans += matrix[i][j];
+            float y2 = 0.299f * candidate_palette_imageorder[j][0] +
+                       0.587f * candidate_palette_imageorder[j][1] +
+                       0.114f * candidate_palette_imageorder[j][2];
+            if (std::abs(y1 - y2) > 100.0f) {
+              high_contrast_trans += matrix[i][j];
+            }
+          }
+        }
+      }
+
+      bool use_luma = false;
+      if (w > 256 || h > 256) {
+        use_luma = (num_rare > num_common);
+      } else {
+        use_luma = (num_rare > num_common) &&
+                   (high_contrast_trans * 5 <= total_trans * 2);
+      }
+
+      if (use_luma) {
+        JXL_DEBUG_V(7, "Palette of %i colors, using luma order", nb_colors);
+        std::sort(
+            candidate_palette_imageorder.begin(),
+            candidate_palette_imageorder.end(),
+            [&](const std::vector<pixel_type>& ap,
+                const std::vector<pixel_type>& bp) {
+              float ay =
+                  (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
+              if (ap.size() > 3) ay *= 1.f + ap[3];
+              float by =
+                  (0.299f * bp[0] + 0.587f * bp[1] + 0.114f * bp[2] + 0.1f);
+              if (bp.size() > 3) by *= 1.f + bp[3];
+              size_t fa = 0, fb = 0;
+              auto ita = color_freq_map.find(ap);
+              if (ita != color_freq_map.end()) fa = ita->second;
+              auto itb = color_freq_map.find(bp);
+              if (itb != color_freq_map.end()) fb = itb->second;
+              ay = fa > 4 ? -ay : ay;
+              by = fb > 4 ? -by : by;
+              if (std::abs(ay - by) > 1e-4f) return ay < by;
+              float acb = -0.1687f * ap[0] - 0.3313f * ap[1] + 0.5f * ap[2];
+              float bcb = -0.1687f * bp[0] - 0.3313f * bp[1] + 0.5f * bp[2];
+              return acb < bcb;
+            });
+      } else {
+        JXL_DEBUG_V(7, "Palette of %i colors, using ezeng order", nb_colors);
+
+        std::vector<size_t> remapping = EZengReindex(matrix);
+        PairwiseSwapSearch(remapping, matrix, 50);
+        TwoOptSearch(remapping, matrix);
+        OrientRemapping(remapping, candidate_palette_imageorder,
+                        color_freq_map);
+
+        std::vector<std::vector<pixel_type>> new_order(num_colors);
+        for (size_t i = 0; i < num_colors; ++i) {
+          new_order[i] = candidate_palette_imageorder[remapping[i]];
+        }
+        candidate_palette_imageorder = std::move(new_order);
+      }
     }
   } else {
     JXL_DEBUG_V(7, "Palette of %i colors, using image order", nb_colors);
@@ -1015,7 +1015,7 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
 Status FwdPalette(Image& input, uint32_t begin_c, uint32_t end_c,
                   uint32_t& nb_colors, uint32_t& nb_deltas, bool ordered,
                   bool lossy, Predictor& predictor,
-                  const weighted::Header& wp_header) {
+                  const weighted::Header& wp_header, bool zero_predictor_mode) {
   PaletteIterationData palette_iteration_data;
   uint32_t nb_colors_orig = nb_colors;
   uint32_t nb_deltas_orig = nb_deltas;
@@ -1023,12 +1023,12 @@ Status FwdPalette(Image& input, uint32_t begin_c, uint32_t end_c,
   if (lossy && input.bitdepth >= 8) {
     JXL_RETURN_IF_ERROR(FwdPaletteIteration(
         input, begin_c, end_c, nb_colors_orig, nb_deltas_orig, ordered, lossy,
-        predictor, wp_header, palette_iteration_data));
+        predictor, wp_header, palette_iteration_data, zero_predictor_mode));
   }
   palette_iteration_data.final_run = true;
   return FwdPaletteIteration(input, begin_c, end_c, nb_colors, nb_deltas,
                              ordered, lossy, predictor, wp_header,
-                             palette_iteration_data);
+                             palette_iteration_data, zero_predictor_mode);
 }
 
 }  // namespace jxl

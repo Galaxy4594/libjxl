@@ -318,7 +318,14 @@ StatusOr<bool> maybe_do_transform(Image& image, const Transform& tr,
   if (did_it) {
     JXL_ASSIGN_OR_RETURN(float cost_after, EstimateCost(image));
     JXL_DEBUG_V(7, "Cost before: %f  cost after: %f", cost_before, cost_after);
-    if (cost_after > cost_before) {
+    float threshold = cost_before;
+    if (cparams.options.predictor == Predictor::Zero) {
+      // In zero-predictor mode (LZ77-dominated), EstimateCost (which assumes
+      // weighted predictor without LZ77) is only an approximation. Allow a
+      // small tolerance so beneficial palettes are not rejected by noise.
+      threshold *= 1.01f;
+    }
+    if (cost_after > threshold) {
       Transform t = image.transform.back();
       if (!t.Inverse(image, wp_header, pool)) {
         return false;
@@ -333,7 +340,7 @@ StatusOr<bool> maybe_do_transform(Image& image, const Transform& tr,
 Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
                     const CompressParams& cparams_,
                     float channel_colors_percent,
-                    jxl::ThreadPool* pool = nullptr) {
+                    jxl::ThreadPool* pool = nullptr, bool is_global = true) {
   float cost_before = 0.f;
   size_t did_palette = 0;
   float nb_pixels = gi.channel[0].w * gi.channel[0].h;
@@ -348,27 +355,32 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
     } else {
       cost_before = nb_pixels * arbitrary_bpp_estimate;
     }
+    const bool zero_pred_mode = (cparams_.options.predictor == Predictor::Zero);
     // all-channel palette (e.g. RGBA)
     if (nb_chans > 1) {
       Transform maybe_palette(TransformId::kPalette);
       maybe_palette.begin_c = gi.nb_meta_channels;
       maybe_palette.num_c = nb_chans;
       // Heuristic choice of max colors for a palette:
-      // max_colors = nb_pixels * estimated_bpp_without_palette * 0.0005 +
-      //              + nb_pixels / 128 + 128
-      //       (estimated_bpp_without_palette = cost_before / nb_pixels)
-      // Rationale: small image with large palette is not effective;
-      // also if the entropy (estimated bpp) is low (e.g. mostly solid/gradient
-      // areas), palette is less useful and may even be counterproductive.
-      maybe_palette.nb_colors = std::min(
-          static_cast<int>(cost_before * 0.0005f + nb_pixels / 128 + 128),
-          std::abs(cparams_.palette_colors));
+      // Global palette: up to half the pixels or palette_colors.
+      // Group palette: small tiles benefit less from large palettes due to
+      // header overhead; also if the entropy (estimated bpp) is low (e.g.
+      // mostly solid/gradient areas), palette is less useful.
+      if (is_global || zero_pred_mode) {
+        maybe_palette.nb_colors = std::min(static_cast<int>(nb_pixels / 2),
+                                           std::abs(cparams_.palette_colors));
+      } else {
+        maybe_palette.nb_colors = std::min(
+            static_cast<int>(cost_before * 0.0005f + nb_pixels / 128 + 128),
+            std::abs(cparams_.palette_colors));
+      }
       maybe_palette.ordered_palette = cparams_.palette_colors >= 0;
       maybe_palette.lossy_palette =
           (cparams_.lossy_palette && maybe_palette.num_c == 3);
       if (maybe_palette.lossy_palette) {
         maybe_palette.predictor = Predictor::Average4;
       }
+      maybe_palette.zero_predictor_mode = zero_pred_mode;
       // TODO(veluca): use a custom weighted header if using the weighted
       // predictor.
       JXL_ASSIGN_OR_RETURN(
@@ -382,14 +394,20 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       Transform maybe_palette_3(TransformId::kPalette);
       maybe_palette_3.begin_c = gi.nb_meta_channels;
       maybe_palette_3.num_c = nb_chans - 1;
-      maybe_palette_3.nb_colors = std::min(
-          static_cast<int>(cost_before * 0.0005f + nb_pixels / 128 + 128),
-          std::abs(cparams_.palette_colors));
+      if (is_global || zero_pred_mode) {
+        maybe_palette_3.nb_colors = std::min(static_cast<int>(nb_pixels / 3),
+                                             std::abs(cparams_.palette_colors));
+      } else {
+        maybe_palette_3.nb_colors = std::min(
+            static_cast<int>(cost_before * 0.0005f + nb_pixels / 128 + 128),
+            std::abs(cparams_.palette_colors));
+      }
       maybe_palette_3.ordered_palette = cparams_.palette_colors >= 0;
       maybe_palette_3.lossy_palette = cparams_.lossy_palette;
       if (maybe_palette_3.lossy_palette) {
         maybe_palette_3.predictor = Predictor::Average4;
       }
+      maybe_palette_3.zero_predictor_mode = zero_pred_mode;
       JXL_ASSIGN_OR_RETURN(
           did_palette,
           maybe_do_transform(gi, maybe_palette_3, cparams_, weighted::Header(),
@@ -482,12 +500,12 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
   }
 
   if (cparams_.ModularPartIsLossless()) {
-    const auto disable_wp = [this] () {
-        cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
-        if (cparams_.options.predictor == Predictor::Weighted) {
-          // Predictor::Best turns to Predictor::Gradient anyways.
-          cparams_.options.predictor = Predictor::Gradient;
-        }
+    const auto disable_wp = [this]() {
+      cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
+      if (cparams_.options.predictor == Predictor::Weighted) {
+        // Predictor::Best turns to Predictor::Gradient anyways.
+        cparams_.options.predictor = Predictor::Gradient;
+      }
     };
     switch (cparams_.decoding_speed_tier) {
       case 0:
@@ -557,7 +575,9 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
         cparams_.options.max_properties,
         static_cast<int>(
             frame_header.nonserialized_metadata->m.num_extra_channels) +
-            (frame_header.nonserialized_metadata->m.color_encoding.IsGray() ? 0 : 2));
+            (frame_header.nonserialized_metadata->m.color_encoding.IsGray()
+                 ? 0
+                 : 2));
     switch (cparams_.speed_tier) {
       case SpeedTier::kHare:
         cparams_.options.splitting_heuristics_properties.assign(
@@ -893,12 +913,14 @@ Status ModularFrameEncoder::ComputeEncodingData(
        (do_color && metadata.bit_depth.bits_per_sample > 8))) {
     channel_colors_percent = cparams_.channel_colors_pre_transform_percent;
   }
-    // Global palette causes bad progressive loading due to interpolation
-    // but lossy palette is still required for JXL art.
-  if (!groupwise && (cparams_.lossy_palette ||
-      !(cparams_.responsive && cparams_.ModularPartIsLossless()))) {
+  // Global palette causes bad progressive loading due to interpolation
+  // but lossy palette is still required for JXL art.
+  if (!groupwise &&
+      (cparams_.lossy_palette ||
+       !(cparams_.responsive && cparams_.ModularPartIsLossless()))) {
     JXL_RETURN_IF_ERROR(try_palettes(gi, max_bitdepth, maxval, cparams_,
-                                     channel_colors_percent, pool));
+                                     channel_colors_percent, pool,
+                                     /*is_global=*/true));
   }
 
   // don't do an RCT if we're short on bits
@@ -1430,9 +1452,10 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
         !cparams.lossy_palette && cparams.speed_tier < SpeedTier::kCheetah) {
       int max_bitdepth = 0, maxval = 0;  // don't care about that here
       float channel_color_percent = 0;
-        channel_color_percent = cparams.channel_colors_percent;
+      channel_color_percent = cparams.channel_colors_percent;
       JXL_RETURN_IF_ERROR(try_palettes(gi, max_bitdepth, maxval, cparams,
-                                       channel_color_percent));
+                                       channel_color_percent, nullptr,
+                                       /*is_global=*/false));
     }
   }
 

@@ -825,7 +825,9 @@ Status RoundtripPatchFrame(Image3F* reference_frame,
   cparams.progressive_mode = Override::kOff;
   cparams.qprogressive_mode = Override::kOff;
   // Use gradient predictor and not Predictor::Best.
-  cparams.options.predictor = Predictor::Gradient;
+  if (cparams.options.predictor != Predictor::Zero) {
+    cparams.options.predictor = Predictor::Gradient;
+  }
   patch_frame_info.save_as_reference = idx;  // always saved.
   patch_frame_info.frame_type = FrameType::kReferenceOnly;
   patch_frame_info.save_before_color_transform = true;
