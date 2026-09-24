@@ -437,6 +437,8 @@ set(JPEGXL_INTERNAL_EXTRAS_SOURCES
   extras/include_jpeglib.h
   extras/mmap.cc
   extras/mmap.h
+  extras/optimize_animation.cc
+  extras/optimize_animation.h
   extras/packed_image.cc
   extras/packed_image.h
   extras/size_constraints.h
