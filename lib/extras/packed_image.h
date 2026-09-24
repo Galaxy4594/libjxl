@@ -194,9 +194,9 @@ class PackedMetadata {
 
 // The extra channel metadata information.
 struct PackedExtraChannel {
-  JxlExtraChannelInfo ec_info;
-  size_t index;
-  std::string name;
+  JxlExtraChannelInfo ec_info = {};
+  size_t index = 0;
+  std::string name = {};
 };
 
 // Helper class representing a JXL image file as decoded to pixels from the API.

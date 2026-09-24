@@ -288,42 +288,6 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
     return true;
   }
 
-  const bool has_extra_channel_alpha_initial =
-      !ppf->frames[0].extra_channels.empty();
-  const bool has_interleaved_alpha_initial =
-      (!has_extra_channel_alpha_initial &&
-       ppf->frames[0].color.format.num_channels >
-           ppf->info.num_color_channels);
-
-  // If there is no alpha channel at all, add an alpha extra channel
-  // so that delta frames can use JXL_BLEND_BLEND (delta zeroing) instead of
-  // being forced to store unchanged pixels within the bounding box with JXL_BLEND_REPLACE.
-  if (!has_extra_channel_alpha_initial && !has_interleaved_alpha_initial &&
-      ppf->info.num_color_channels == 3 &&
-      ppf->frames[0].color.format.data_type == JXL_TYPE_UINT8) {
-    ppf->info.alpha_bits = 8;
-    ppf->info.num_extra_channels = 1;
-    PackedExtraChannel ec;
-    ec.ec_info.type = JXL_CHANNEL_ALPHA;
-    ec.ec_info.bits_per_sample = 8;
-    ec.ec_info.dim_shift = 0;
-    ec.index = 0;
-    ppf->extra_channels_info.push_back(ec);
-
-    const JxlPixelFormat alpha_format{
-        /*num_channels=*/1u,
-        /*data_type=*/JXL_TYPE_UINT8,
-        /*endianness=*/JXL_NATIVE_ENDIAN,
-        /*align=*/0,
-    };
-
-    for (size_t f = 0; f < ppf->frames.size(); ++f) {
-      JXL_ASSIGN_OR_RETURN(PackedImage f_alpha,
-                           PackedImage::Create(W, H, alpha_format));
-      memset(f_alpha.pixels(), 255, f_alpha.pixels_size);
-      ppf->frames[f].extra_channels.emplace_back(std::move(f_alpha));
-    }
-  }
 
   // 2b. Clean dirty transparent pixels (where alpha == 0, zero out color channels).
   // Matches apngopt's optim_dirty() and libwebp's WebPCleanupTransparentArea().
