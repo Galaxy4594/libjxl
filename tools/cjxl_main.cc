@@ -270,6 +270,11 @@ struct CompressArgs {
                             "Force premultiplied (associated) alpha.",
                             &premultiply, &ParseSigned, 2);
 
+    cmdline->AddOptionValue(
+        '\0', "optimize_animation", "0|1",
+        "0 = disable animation delta optimization. 1 = enable (default).",
+        &optimize_animation, &ParseOverride, 2);
+
     cmdline->AddOptionValue('\0', "keep_invisible", "0|1",
                             "0 = allow modifying invisible pixels for better "
                             "density, default for lossy output.\n"
@@ -538,6 +543,7 @@ struct CompressArgs {
   bool already_downsampled = false;
   jxl::Override jpeg_reconstruction_cfl = jxl::Override::kDefault;
   jxl::Override modular = jxl::Override::kDefault;
+  jxl::Override optimize_animation = jxl::Override::kDefault;
   jxl::Override keep_invisible = jxl::Override::kDefault;
   jxl::Override dots = jxl::Override::kDefault;
   jxl::Override patches = jxl::Override::kDefault;
@@ -1112,6 +1118,13 @@ int main(int argc, char** argv) {
       if (ppf.frames.empty()) {
         std::cerr << "No frames on input file.\n";
         exit(EXIT_FAILURE);
+      }
+      if (ppf.info.have_animation && ppf.frames.size() > 1 &&
+          args.optimize_animation != jxl::Override::kOff) {
+        if (!jxl::extras::OptimizeAnimation(&ppf)) {
+          std::cerr << "Animation optimization failed.\n";
+          exit(EXIT_FAILURE);
+        }
       }
       pixels = static_cast<size_t>(ppf.info.xsize) * ppf.info.ysize;
       const double t1 = jxl::Now();

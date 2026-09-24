@@ -209,10 +209,6 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
               canvas.color.xsize * canvas.color.ysize, background_rgba);
   Rect canvas_rect{0, 0, canvas.color.xsize, canvas.color.ysize};
 
-  Rect previous_rect_if_restore_to_background;
-
-  bool replace = true;
-  bool last_base_was_none = true;
   for (int i = 0; i < gif->ImageCount; ++i) {
     const SavedImage& image = gif->SavedImages[i];
     msan::UnpoisonMemory(image.RasterBits, sizeof(*image.RasterBits) *
@@ -220,55 +216,26 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
                                                image.ImageDesc.Height);
     const Rect image_rect(image.ImageDesc.Left, image.ImageDesc.Top,
                           image.ImageDesc.Width, image.ImageDesc.Height);
-
-    Rect total_rect;
-    if (previous_rect_if_restore_to_background.xsize() != 0 ||
-        previous_rect_if_restore_to_background.ysize() != 0) {
-      const size_t xbegin = std::min(
-          image_rect.x0(), previous_rect_if_restore_to_background.x0());
-      const size_t ybegin = std::min(
-          image_rect.y0(), previous_rect_if_restore_to_background.y0());
-      const size_t xend =
-          std::max(image_rect.x0() + image_rect.xsize(),
-                   previous_rect_if_restore_to_background.x0() +
-                       previous_rect_if_restore_to_background.xsize());
-      const size_t yend =
-          std::max(image_rect.y0() + image_rect.ysize(),
-                   previous_rect_if_restore_to_background.y0() +
-                       previous_rect_if_restore_to_background.ysize());
-      total_rect = Rect(xbegin, ybegin, xend - xbegin, yend - ybegin);
-      previous_rect_if_restore_to_background = Rect();
-      replace = true;
-    } else {
-      total_rect = image_rect;
-      replace = false;
-    }
     if (!image_rect.IsInside(canvas_rect)) {
       return JXL_FAILURE("GIF frame extends outside of the canvas");
     }
 
-    // Allocates the frame buffer.
+    // Allocates the full canvas frame buffer.
     {
       JXL_ASSIGN_OR_RETURN(
           PackedFrame frame,
-          PackedFrame::Create(total_rect.xsize(), total_rect.ysize(),
+          PackedFrame::Create(canvas.color.xsize, canvas.color.ysize,
                               packed_frame_format));
       ppf->frames.emplace_back(std::move(frame));
     }
 
-    PackedFrame* frame = &ppf->frames.back();
+    PackedFrame* pframe = &ppf->frames.back();
 
-    // We cannot tell right from the start whether there will be a
-    // need for an alpha channel. This is discovered only as soon as
-    // we see a transparent pixel. We hence initialize alpha lazily.
-    auto set_pixel_alpha = [&frame](size_t x, size_t y, uint8_t a) -> Status {
-      // If we do not have an alpha-channel and a==255 (fully opaque),
-      // we can skip setting this pixel-value and rely on
-      // "no alpha channel = no transparency".
-      if (a == 255 && frame->extra_channels.empty()) return true;
-      JXL_RETURN_IF_ERROR(ensure_have_alpha(frame));
+    auto set_pixel_alpha = [&pframe](size_t x, size_t y, uint8_t a) -> Status {
+      if (a == 255 && pframe->extra_channels.empty()) return true;
+      JXL_RETURN_IF_ERROR(ensure_have_alpha(pframe));
       static_cast<uint8_t*>(
-          frame->extra_channels[0].pixels())[y * frame->color.xsize + x] = a;
+          pframe->extra_channels[0].pixels())[y * pframe->color.xsize + x] = a;
       return true;
     };
 
@@ -281,53 +248,19 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
     GraphicsControlBlock gcb;
     DGifSavedExtensionToGCB(gif.get(), i, &gcb);
     msan::UnpoisonMemory(&gcb, sizeof(gcb));
-    bool is_full_size = total_rect.x0() == 0 && total_rect.y0() == 0 &&
-                        total_rect.xsize() == canvas.color.xsize &&
-                        total_rect.ysize() == canvas.color.ysize;
+
     if (ppf->info.have_animation) {
-      frame->frame_info.duration = gcb.DelayTime;
-      frame->frame_info.layer_info.have_crop = static_cast<int>(!is_full_size);
-      frame->frame_info.layer_info.crop_x0 = total_rect.x0();
-      frame->frame_info.layer_info.crop_y0 = total_rect.y0();
-      frame->frame_info.layer_info.xsize = frame->color.xsize;
-      frame->frame_info.layer_info.ysize = frame->color.ysize;
-      if (last_base_was_none) {
-        replace = true;
-      }
-      frame->frame_info.layer_info.blend_info.blendmode =
-          replace ? JXL_BLEND_REPLACE : JXL_BLEND_BLEND;
-      // We always only reference at most the last frame
-      frame->frame_info.layer_info.blend_info.source =
-          last_base_was_none ? 0u : 1u;
-      frame->frame_info.layer_info.blend_info.clamp = 1;
-      frame->frame_info.layer_info.blend_info.alpha = 0;
-      // TODO(veluca): this could in principle be implemented.
-      if (last_base_was_none &&
-          (total_rect.x0() != 0 || total_rect.y0() != 0 ||
-           total_rect.xsize() != canvas.color.xsize ||
-           total_rect.ysize() != canvas.color.ysize || !replace)) {
-        if (!JXL_IS_DEBUG_BUILD) {
-          fprintf(stderr,
-              "GIF with dispose-to-0 is not supported for non-full or blended "
-              "frames\n");
-        }
-        return JXL_FAILURE(
-            "GIF with dispose-to-0 is not supported"
-            "for non-full or blended frames");
-      }
-      switch (gcb.DisposalMode) {
-        case DISPOSE_DO_NOT:
-        case DISPOSE_BACKGROUND:
-          frame->frame_info.layer_info.save_as_reference = 1u;
-          last_base_was_none = false;
-          break;
-        case DISPOSE_PREVIOUS:
-          frame->frame_info.layer_info.save_as_reference = 0u;
-          break;
-        default:
-          frame->frame_info.layer_info.save_as_reference = 0u;
-          last_base_was_none = true;
-      }
+      pframe->frame_info.duration = gcb.DelayTime;
+      pframe->frame_info.layer_info.have_crop = 0;
+      pframe->frame_info.layer_info.crop_x0 = 0;
+      pframe->frame_info.layer_info.crop_y0 = 0;
+      pframe->frame_info.layer_info.xsize = canvas.color.xsize;
+      pframe->frame_info.layer_info.ysize = canvas.color.ysize;
+      pframe->frame_info.layer_info.blend_info.blendmode = JXL_BLEND_REPLACE;
+      pframe->frame_info.layer_info.blend_info.source = 0;
+      pframe->frame_info.layer_info.blend_info.clamp = 1;
+      pframe->frame_info.layer_info.blend_info.alpha = 0;
+      pframe->frame_info.layer_info.save_as_reference = 0;
     }
 
     // Update the canvas by creating a copy first.
@@ -338,8 +271,6 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
     memcpy(new_canvas_image.pixels(), canvas.color.pixels(),
            new_canvas_image.pixels_size);
     for (size_t y = 0, byte_index = 0; y < image_rect.ysize(); ++y) {
-      // Assumes format.align == 0. row points to the beginning of the y row in
-      // the image_rect.
       PackedRgba* row = static_cast<PackedRgba*>(new_canvas_image.pixels()) +
                         (y + image_rect.y0()) * new_canvas_image.xsize +
                         image_rect.x0();
@@ -357,49 +288,25 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
         row[x].a = 255;
       }
     }
-    const PackedImage& sub_frame_image = frame->color;
-    if (replace) {
-      // Copy from the new canvas image to the subframe
-      for (size_t y = 0; y < total_rect.ysize(); ++y) {
-        const PackedRgba* row_in =
-            static_cast<const PackedRgba*>(new_canvas_image.pixels()) +
-            (y + total_rect.y0()) * new_canvas_image.xsize + total_rect.x0();
-        PackedRgb* row_out = static_cast<PackedRgb*>(sub_frame_image.pixels()) +
-                             y * sub_frame_image.xsize;
-        for (size_t x = 0; x < sub_frame_image.xsize; ++x) {
-          row_out[x].r = row_in[x].r;
-          row_out[x].g = row_in[x].g;
-          row_out[x].b = row_in[x].b;
+
+    // Copy from the new canvas image to the frame
+    for (size_t y = 0; y < canvas.color.ysize; ++y) {
+      const PackedRgba* row_in =
+          static_cast<const PackedRgba*>(new_canvas_image.pixels()) +
+          y * new_canvas_image.xsize;
+      PackedRgb* row_out = static_cast<PackedRgb*>(pframe->color.pixels()) +
+                           y * pframe->color.xsize;
+      for (size_t x = 0; x < canvas.color.xsize; ++x) {
+        row_out[x].r = row_in[x].r;
+        row_out[x].g = row_in[x].g;
+        row_out[x].b = row_in[x].b;
+        if (row_in[x].a != 255) {
           JXL_RETURN_IF_ERROR(set_pixel_alpha(x, y, row_in[x].a));
-        }
-      }
-    } else {
-      for (size_t y = 0, byte_index = 0; y < image_rect.ysize(); ++y) {
-        // Assumes format.align == 0
-        PackedRgb* row = static_cast<PackedRgb*>(sub_frame_image.pixels()) +
-                         y * sub_frame_image.xsize;
-        for (size_t x = 0; x < image_rect.xsize(); ++x, ++byte_index) {
-          const GifByteType byte = image.RasterBits[byte_index];
-          if (byte >= color_map->ColorCount) {
-            return JXL_FAILURE("GIF color is out of bounds");
-          }
-          if (byte == gcb.TransparentColor) {
-            row[x].r = 0;
-            row[x].g = 0;
-            row[x].b = 0;
-            JXL_RETURN_IF_ERROR(set_pixel_alpha(x, y, 0));
-            continue;
-          }
-          GifColorType color = color_map->Colors[byte];
-          row[x].r = color.Red;
-          row[x].g = color.Green;
-          row[x].b = color.Blue;
-          JXL_RETURN_IF_ERROR(set_pixel_alpha(x, y, 255));
         }
       }
     }
 
-    if (!frame->extra_channels.empty()) {
+    if (!pframe->extra_channels.empty()) {
       ppf->info.alpha_bits = 8;
     }
 
@@ -409,18 +316,25 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
         break;
 
       case DISPOSE_BACKGROUND:
-        std::fill_n(static_cast<PackedRgba*>(canvas.color.pixels()),
-                    canvas.color.xsize * canvas.color.ysize, background_rgba);
-        previous_rect_if_restore_to_background = image_rect;
+        for (size_t y = 0; y < image_rect.ysize(); ++y) {
+          PackedRgba* row =
+              static_cast<PackedRgba*>(new_canvas_image.pixels()) +
+              (y + image_rect.y0()) * new_canvas_image.xsize + image_rect.x0();
+          for (size_t x = 0; x < image_rect.xsize(); ++x) {
+            row[x] = background_rgba;
+          }
+        }
+        canvas.color = std::move(new_canvas_image);
         break;
 
       case DISPOSE_PREVIOUS:
+        // canvas.color remains untouched (contains previous canvas state).
         break;
 
       case DISPOSAL_UNSPECIFIED:
       default:
-        std::fill_n(static_cast<PackedRgba*>(canvas.color.pixels()),
-                    canvas.color.xsize * canvas.color.ysize, background_rgba);
+        canvas.color = std::move(new_canvas_image);
+        break;
     }
   }
   // Finally, if any frame has an alpha-channel, every frame will need

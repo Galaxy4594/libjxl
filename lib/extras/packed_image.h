@@ -244,6 +244,12 @@ class PackedPixelFile {
   Status ShrinkTo(size_t new_xsize, size_t new_ysize);
 };
 
+// Optimizes an animation in-place:
+// - Removes consecutive duplicate frames and accumulates their durations.
+// - Crops unoptimized full-canvas frames to minimal bounding boxes.
+// - Applies delta zeroing with alpha blending (or replacement) to unchanged pixels.
+Status OptimizeAnimation(PackedPixelFile* ppf);
+
 }  // namespace extras
 }  // namespace jxl
 

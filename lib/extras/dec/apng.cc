@@ -1190,8 +1190,25 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
     ppf->info.intensity_target = 0.f;
   }
 
-  bool has_nontrivial_background = false;
-  bool previous_frame_should_be_cleared = false;
+  if (frames.empty()) return JXL_FAILURE("No frames decoded");
+
+  const size_t canvas_w = ppf->info.xsize;
+  const size_t canvas_h = ppf->info.ysize;
+  const JxlPixelFormat canvas_format = frames[0].pixels.format;
+  JXL_RETURN_IF_ERROR(PackedImage::ValidateDataType(canvas_format.data_type));
+  const size_t bytes_per_sample =
+      PackedImage::BitsPerChannel(canvas_format.data_type) / 8;
+  const size_t pixel_stride = bytes_per_sample * canvas_format.num_channels;
+  const bool has_alpha =
+      (canvas_format.num_channels == 2 || canvas_format.num_channels == 4);
+  const size_t alpha_idx = canvas_format.num_channels - 1;
+
+  JXL_ASSIGN_OR_RETURN(
+      PackedImage canvas,
+      PackedImage::Create(canvas_w, canvas_h, canvas_format));
+  memset(canvas.pixels(), 0, canvas.pixels_size);
+  JXL_ASSIGN_OR_RETURN(PackedImage prev_canvas, canvas.Copy());
+
   for (size_t i = 0; i < frames.size(); i++) {
     Frame& frame = frames[i];
     const FrameControl& fc = frame.metadata;
@@ -1199,105 +1216,90 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
     const auto& pixels = frame.pixels;
     size_t xsize = pixels.xsize;
     size_t ysize = pixels.ysize;
+    size_t x0 = vp.x0();
+    size_t y0 = vp.y0();
     JXL_ENSURE(xsize == vp.xsize());
     JXL_ENSURE(ysize == vp.ysize());
 
-    // Before encountering a DISPOSE_OP_NONE frame, the canvas is filled with
-    // 0, so DISPOSE_OP_BACKGROUND and DISPOSE_OP_PREVIOUS are equivalent.
-    if (fc.dispose_op == DisposeOp::NONE) {
-      has_nontrivial_background = true;
+    if (fc.dispose_op == DisposeOp::PREVIOUS) {
+      JXL_ASSIGN_OR_RETURN(prev_canvas, canvas.Copy());
     }
-    bool should_blend = fc.blend_op == BlendOp::OVER;
-    bool use_for_next_frame =
-        has_nontrivial_background && fc.dispose_op != DisposeOp::PREVIOUS;
-    size_t x0 = vp.x0();
-    size_t y0 = vp.y0();
-    if (previous_frame_should_be_cleared) {
-      const auto& pvp = frames[i - 1].metadata.viewport;
-      size_t px0 = pvp.x0();
-      size_t py0 = pvp.y0();
-      size_t pxs = pvp.xsize();
-      size_t pys = pvp.ysize();
-      if (px0 >= x0 && py0 >= y0 && px0 + pxs <= x0 + xsize &&
-          py0 + pys <= y0 + ysize && fc.blend_op == BlendOp::SOURCE &&
-          use_for_next_frame) {
-        // If the previous frame is entirely contained in the current frame
-        // and we are using BLEND_OP_SOURCE, nothing special needs to be done.
-        ppf->frames.emplace_back(std::move(frame.pixels));
-      } else if (px0 == x0 && py0 == y0 && px0 + pxs == x0 + xsize &&
-                 py0 + pys == y0 + ysize && use_for_next_frame) {
-        // If the new frame has the same size as the old one, but we are
-        // blending, we can instead just not blend.
-        should_blend = false;
-        ppf->frames.emplace_back(std::move(frame.pixels));
-      } else if (px0 <= x0 && py0 <= y0 && px0 + pxs >= x0 + xsize &&
-                 py0 + pys >= y0 + ysize && use_for_next_frame) {
-        // If the new frame is contained within the old frame, we can pad the
-        // new frame with zeros and not blend.
-        JXL_ASSIGN_OR_RETURN(PackedImage new_data,
-                             PackedImage::Create(pxs, pys, pixels.format));
-        memset(new_data.pixels(), 0, new_data.pixels_size);
-        for (size_t y = 0; y < ysize; y++) {
-          JXL_RETURN_IF_ERROR(
-              PackedImage::ValidateDataType(new_data.format.data_type));
-          size_t bytes_per_sample =
-              PackedImage::BitsPerChannel(new_data.format.data_type) / 8;
-          size_t pixel_stride = bytes_per_sample * new_data.format.num_channels;
-          memcpy(
-              static_cast<uint8_t*>(new_data.pixels()) +
-                  new_data.stride * (y + y0 - py0) + pixel_stride * (x0 - px0),
-              static_cast<const uint8_t*>(pixels.pixels()) + pixels.stride * y,
-              xsize * pixel_stride);
-        }
 
-        x0 = px0;
-        y0 = py0;
-        xsize = pxs;
-        ysize = pys;
-        should_blend = false;
-        ppf->frames.emplace_back(std::move(new_data));
-      } else {
-        // If all else fails, insert a placeholder blank frame with kReplace.
-        JXL_ASSIGN_OR_RETURN(PackedImage blank,
-                             PackedImage::Create(pxs, pys, pixels.format));
-        memset(blank.pixels(), 0, blank.pixels_size);
-        ppf->frames.emplace_back(std::move(blank));
-        auto& pframe = ppf->frames.back();
-        pframe.frame_info.layer_info.crop_x0 = px0;
-        pframe.frame_info.layer_info.crop_y0 = py0;
-        pframe.frame_info.layer_info.xsize = pxs;
-        pframe.frame_info.layer_info.ysize = pys;
-        pframe.frame_info.duration = 0;
-        bool is_full_size = px0 == 0 && py0 == 0 && pxs == ppf->info.xsize &&
-                            pys == ppf->info.ysize;
-        pframe.frame_info.layer_info.have_crop = is_full_size ? 0 : 1;
-        pframe.frame_info.layer_info.blend_info.blendmode = JXL_BLEND_REPLACE;
-        pframe.frame_info.layer_info.blend_info.source = 1;
-        pframe.frame_info.layer_info.save_as_reference = 1;
-        ppf->frames.emplace_back(std::move(frame.pixels));
+    if (fc.blend_op == BlendOp::SOURCE || !has_alpha) {
+      for (size_t y = 0; y < ysize; ++y) {
+        memcpy(static_cast<uint8_t*>(canvas.pixels()) +
+                   (y0 + y) * canvas.stride + x0 * pixel_stride,
+               static_cast<const uint8_t*>(pixels.pixels()) + y * pixels.stride,
+               xsize * pixel_stride);
       }
     } else {
-      ppf->frames.emplace_back(std::move(frame.pixels));
+      if (canvas_format.data_type == JXL_TYPE_UINT8) {
+        for (size_t y = 0; y < ysize; ++y) {
+          const uint8_t* sp = static_cast<const uint8_t*>(pixels.pixels()) +
+                              y * pixels.stride;
+          uint8_t* dp = static_cast<uint8_t*>(canvas.pixels()) +
+                        (y0 + y) * canvas.stride + x0 * pixel_stride;
+          for (size_t x = 0; x < xsize;
+               ++x, sp += pixel_stride, dp += pixel_stride) {
+            uint8_t sa = sp[alpha_idx];
+            if (sa == 255) {
+              memcpy(dp, sp, pixel_stride);
+            } else if (sa != 0) {
+              uint8_t da = dp[alpha_idx];
+              if (da == 0) {
+                memcpy(dp, sp, pixel_stride);
+              } else {
+                int u = sa * 255;
+                int v = (255 - sa) * da;
+                int al = u + v;
+                for (size_t c = 0; c < alpha_idx; ++c) {
+                  dp[c] = (sp[c] * u + dp[c] * v) / al;
+                }
+                dp[alpha_idx] = al / 255;
+              }
+            }
+          }
+        }
+      } else {
+        for (size_t y = 0; y < ysize; ++y) {
+          memcpy(static_cast<uint8_t*>(canvas.pixels()) +
+                     (y0 + y) * canvas.stride + x0 * pixel_stride,
+                 static_cast<const uint8_t*>(pixels.pixels()) +
+                     y * pixels.stride,
+                 xsize * pixel_stride);
+        }
+      }
     }
 
-    auto& pframe = ppf->frames.back();
-    pframe.frame_info.layer_info.crop_x0 = x0;
-    pframe.frame_info.layer_info.crop_y0 = y0;
-    pframe.frame_info.layer_info.xsize = xsize;
-    pframe.frame_info.layer_info.ysize = ysize;
+    // Emit the full canvas frame into ppf->frames
+    JXL_ASSIGN_OR_RETURN(
+        PackedFrame pframe,
+        PackedFrame::Create(canvas_w, canvas_h, canvas_format));
+    memcpy(pframe.color.pixels(), canvas.pixels(), canvas.pixels_size);
     pframe.frame_info.duration =
         fc.delay_num * 1000 / (fc.delay_den ? fc.delay_den : 100);
-    pframe.frame_info.layer_info.blend_info.blendmode =
-        should_blend ? JXL_BLEND_BLEND : JXL_BLEND_REPLACE;
-    bool is_full_size = x0 == 0 && y0 == 0 && xsize == ppf->info.xsize &&
-                        ysize == ppf->info.ysize;
-    pframe.frame_info.layer_info.have_crop = is_full_size ? 0 : 1;
-    pframe.frame_info.layer_info.blend_info.source = 1;
+    pframe.frame_info.layer_info.have_crop = 0;
+    pframe.frame_info.layer_info.crop_x0 = 0;
+    pframe.frame_info.layer_info.crop_y0 = 0;
+    pframe.frame_info.layer_info.xsize = canvas_w;
+    pframe.frame_info.layer_info.ysize = canvas_h;
+    pframe.frame_info.layer_info.blend_info.blendmode = JXL_BLEND_REPLACE;
+    pframe.frame_info.layer_info.blend_info.source = 0;
+    pframe.frame_info.layer_info.blend_info.clamp = 1;
     pframe.frame_info.layer_info.blend_info.alpha = 0;
-    pframe.frame_info.layer_info.save_as_reference = use_for_next_frame ? 1 : 0;
+    pframe.frame_info.layer_info.save_as_reference = 0;
+    ppf->frames.emplace_back(std::move(pframe));
 
-    previous_frame_should_be_cleared =
-        has_nontrivial_background && (fc.dispose_op == DisposeOp::BACKGROUND);
+    // Handle disposal for subsequent frames
+    if (fc.dispose_op == DisposeOp::BACKGROUND) {
+      for (size_t y = 0; y < ysize; ++y) {
+        memset(static_cast<uint8_t*>(canvas.pixels()) +
+                   (y0 + y) * canvas.stride + x0 * pixel_stride,
+               0, xsize * pixel_stride);
+      }
+    } else if (fc.dispose_op == DisposeOp::PREVIOUS) {
+      canvas = std::move(prev_canvas);
+    }
   }
 
   if (ppf->frames.empty()) return JXL_FAILURE("No frames decoded");
