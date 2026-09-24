@@ -243,6 +243,7 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
 
     size_t x_min = W, y_min = H, x_max = 0, y_max = 0;
     bool found_diff = false;
+    size_t num_diff_pixels = 0;
 
     for (size_t y = 0; y < H; ++y) {
       const uint8_t* c_color_row =
@@ -277,6 +278,7 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
         }
         if (diff) {
           found_diff = true;
+          ++num_diff_pixels;
           if (x < x_min) x_min = x;
           if (x > x_max) x_max = x;
           if (y < y_min) y_min = y;
@@ -296,8 +298,17 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
     size_t y0 = y_min;
     size_t w = x_max - x_min + 1;
     size_t h = y_max - y_min + 1;
+    const size_t box_pixels = w * h;
+    const size_t same_pixels =
+        (box_pixels > num_diff_pixels) ? (box_pixels - num_diff_pixels) : 0;
+    const double same_ratio = (box_pixels > 0)
+                                  ? (static_cast<double>(same_pixels) /
+                                     static_cast<double>(box_pixels))
+                                  : 0.0;
 
-    bool can_use_blend = has_extra_channel_alpha || has_interleaved_alpha;
+    const bool bounding_box_is_large = (box_pixels >= 0.85 * W * H);
+    bool can_use_blend = (has_extra_channel_alpha || has_interleaved_alpha) &&
+                         (!bounding_box_is_large || same_ratio >= 0.70);
     if (can_use_blend && found_diff) {
       if (has_extra_channel_alpha) {
         for (size_t y = 0; y < h; ++y) {
@@ -366,6 +377,21 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
           if (!can_use_blend) break;
         }
       }
+    }
+
+    if (bounding_box_is_large && !can_use_blend) {
+      curr_frame.frame_info.layer_info.have_crop = 0;
+      curr_frame.frame_info.layer_info.crop_x0 = 0;
+      curr_frame.frame_info.layer_info.crop_y0 = 0;
+      curr_frame.frame_info.layer_info.xsize = W;
+      curr_frame.frame_info.layer_info.ysize = H;
+      curr_frame.frame_info.layer_info.blend_info.blendmode = JXL_BLEND_REPLACE;
+      curr_frame.frame_info.layer_info.blend_info.source = 1;
+      curr_frame.frame_info.layer_info.blend_info.alpha = 0;
+      curr_frame.frame_info.layer_info.blend_info.clamp = 1;
+      curr_frame.frame_info.layer_info.save_as_reference = 1;
+      JXL_ASSIGN_OR_RETURN(canvas, curr_frame.Copy());
+      continue;
     }
 
     JXL_ASSIGN_OR_RETURN(PackedFrame cropped,

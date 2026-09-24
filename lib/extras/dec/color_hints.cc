@@ -74,6 +74,7 @@ Status ApplyColorHints(const ColorHints& color_hints,
     ppf->color_encoding.white_point = JXL_WHITE_POINT_D65;
     ppf->color_encoding.primaries = JXL_PRIMARIES_SRGB;
     ppf->color_encoding.transfer_function = JXL_TRANSFER_FUNCTION_SRGB;
+    ppf->color_encoding.rendering_intent = JXL_RENDERING_INTENT_RELATIVE;
   }
 
   return true;
