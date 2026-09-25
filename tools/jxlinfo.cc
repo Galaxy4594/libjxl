@@ -360,6 +360,10 @@ static int PrintBasicInfo(FILE* file, int verbose) {
           printf(", time code: %X", frame_header.timecode);
         }
       }
+      printf(", blend: %d (src: %u), save_ref: %d",
+             static_cast<int>(frame_header.layer_info.blend_info.blendmode),
+             frame_header.layer_info.blend_info.source,
+             frame_header.layer_info.save_as_reference);
       if (frame_header.name_length) {
         std::vector<char> name(frame_header.name_length + 1);
         if (JXL_DEC_SUCCESS !=

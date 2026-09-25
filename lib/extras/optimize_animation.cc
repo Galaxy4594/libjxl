@@ -73,6 +73,46 @@ bool FramesEqual(const PackedFrame& f1, const PackedFrame& f2) {
   return true;
 }
 
+bool DeltaEnablesPalette(const uint8_t* p_color, size_t p_stride,
+                         const uint8_t* c_color, size_t c_stride, size_t W,
+                         size_t H, size_t color_pixel_stride) {
+  std::vector<uint32_t> table(1024);
+  const auto count_colors = [&](bool delta_only) -> size_t {
+    memset(table.data(), 0, table.size() * sizeof(uint32_t));
+    size_t count = 0;
+    for (size_t y = 0; y < H; ++y) {
+      const uint8_t* p_row = p_color + y * p_stride;
+      const uint8_t* c_row = c_color + y * c_stride;
+      for (size_t x = 0; x < W; ++x) {
+        if (delta_only &&
+            memcmp(p_row + x * color_pixel_stride,
+                   c_row + x * color_pixel_stride, color_pixel_stride) == 0) {
+          continue;
+        }
+        uint32_t c =
+            (static_cast<uint32_t>(c_row[x * color_pixel_stride]) << 16) |
+            (static_cast<uint32_t>(c_row[x * color_pixel_stride + 1]) << 8) |
+            static_cast<uint32_t>(c_row[x * color_pixel_stride + 2]);
+        uint32_t entry = 0x01000000 | c;
+        uint32_t h = (c * 2654435761u) & 1023;
+        while (table[h] != 0 && table[h] != entry) {
+          h = (h + 1) & 1023;
+        }
+        if (table[h] == 0) {
+          table[h] = entry;
+          if (++count > 256) return count;
+        }
+      }
+    }
+    return count;
+  };
+
+  size_t delta_colors = count_colors(/*delta_only=*/true);
+  if (delta_colors > 256) return false;
+  size_t full_colors = count_colors(/*delta_only=*/false);
+  return (full_colors > 256 && delta_colors <= 256);
+}
+
 }  // namespace
 
 Status OptimizeAnimation(PackedPixelFile* ppf) {
@@ -255,7 +295,13 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
           size_t same_pixels = box_pixels - num_diff_pixels;
           double same_ratio = static_cast<double>(same_pixels) /
                               static_cast<double>(box_pixels);
-          if (same_ratio >= 0.70) {
+          if (same_ratio >= 0.70 ||
+              (same_ratio >= 0.20 &&
+               DeltaEnablesPalette(
+                   static_cast<const uint8_t*>(prev.color.pixels()),
+                   prev.color.stride,
+                   static_cast<const uint8_t*>(curr.color.pixels()),
+                   curr.color.stride, W, H, color_pixel_stride))) {
             needs_alpha_for_blending = true;
             break;
           }
@@ -388,10 +434,21 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
                                   ? (static_cast<double>(same_pixels) /
                                      static_cast<double>(box_pixels))
                                   : 0.0;
-
     const bool bounding_box_is_large = (box_pixels >= 0.85 * W * H);
-    bool can_use_blend = (has_extra_channel_alpha || has_interleaved_alpha) &&
-                         (!bounding_box_is_large || same_ratio >= 0.70);
+    bool can_use_blend = false;
+    if (has_extra_channel_alpha || has_interleaved_alpha) {
+      if (!bounding_box_is_large || same_ratio >= 0.70) {
+        can_use_blend = true;
+      } else if (same_ratio >= 0.20 &&
+                 ppf->frames[0].color.format.data_type == JXL_TYPE_UINT8 &&
+                 ppf->info.num_color_channels == 3) {
+        can_use_blend = DeltaEnablesPalette(
+            static_cast<const uint8_t*>(canvas.color.pixels()),
+            canvas.color.stride,
+            static_cast<const uint8_t*>(curr_frame.color.pixels()),
+            curr_frame.color.stride, W, H, color_pixel_stride);
+      }
+    }
     if (can_use_blend && found_diff) {
       if (has_extra_channel_alpha) {
         for (size_t y = 0; y < h; ++y) {
