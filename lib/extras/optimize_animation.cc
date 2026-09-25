@@ -206,6 +206,89 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
     }
   }
 
+  const bool has_extra_channel_alpha_initial =
+      !ppf->frames[0].extra_channels.empty();
+  const bool has_interleaved_alpha_initial =
+      (!has_extra_channel_alpha_initial &&
+       ppf->frames[0].color.format.num_channels > ppf->info.num_color_channels);
+
+  if (!has_extra_channel_alpha_initial && !has_interleaved_alpha_initial &&
+      ppf->info.num_color_channels == 3 &&
+      ppf->frames[0].color.format.data_type == JXL_TYPE_UINT8) {
+    // Check if any frame actually benefits from delta blending before
+    // allocating an extra alpha channel across all frames.
+    // If an animation is photographic/video-like with continuous camera motion
+    // (where bounding boxes are large and diffs are pervasive, same_ratio <
+    // 0.70), delta blending will not be used, and adding an alpha channel
+    // wastes bitstream headers and extra channel data (especially in VarDCT
+    // lossy mode).
+    bool needs_alpha_for_blending = false;
+    const size_t color_pixel_stride = 3;
+    for (size_t i = 1; i < ppf->frames.size(); ++i) {
+      const PackedFrame& prev = ppf->frames[i - 1];
+      const PackedFrame& curr = ppf->frames[i];
+      size_t x_min = W, y_min = H, x_max = 0, y_max = 0;
+      size_t num_diff_pixels = 0;
+      for (size_t y = 0; y < H; ++y) {
+        const uint8_t* p_row =
+            static_cast<const uint8_t*>(prev.color.pixels()) +
+            y * prev.color.stride;
+        const uint8_t* c_row =
+            static_cast<const uint8_t*>(curr.color.pixels()) +
+            y * curr.color.stride;
+        for (size_t x = 0; x < W; ++x) {
+          if (memcmp(p_row + x * color_pixel_stride,
+                     c_row + x * color_pixel_stride, color_pixel_stride) != 0) {
+            ++num_diff_pixels;
+            if (x < x_min) x_min = x;
+            if (x > x_max) x_max = x;
+            if (y < y_min) y_min = y;
+            if (y > y_max) y_max = y;
+          }
+        }
+      }
+      if (num_diff_pixels > 0) {
+        size_t w = x_max - x_min + 1;
+        size_t h = y_max - y_min + 1;
+        size_t box_pixels = w * h;
+        if (box_pixels >= 0.85 * W * H) {
+          size_t same_pixels = box_pixels - num_diff_pixels;
+          double same_ratio = static_cast<double>(same_pixels) /
+                              static_cast<double>(box_pixels);
+          if (same_ratio >= 0.70) {
+            needs_alpha_for_blending = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (needs_alpha_for_blending) {
+      ppf->info.alpha_bits = 8;
+      ppf->info.num_extra_channels = 1;
+      PackedExtraChannel ec;
+      ec.ec_info.type = JXL_CHANNEL_ALPHA;
+      ec.ec_info.bits_per_sample = 8;
+      ec.ec_info.dim_shift = 0;
+      ec.index = 0;
+      ppf->extra_channels_info.push_back(ec);
+
+      const JxlPixelFormat alpha_format{
+          /*num_channels=*/1u,
+          /*data_type=*/JXL_TYPE_UINT8,
+          /*endianness=*/JXL_NATIVE_ENDIAN,
+          /*align=*/0,
+      };
+
+      for (size_t f = 0; f < ppf->frames.size(); ++f) {
+        JXL_ASSIGN_OR_RETURN(PackedImage f_alpha,
+                             PackedImage::Create(W, H, alpha_format));
+        memset(f_alpha.pixels(), 255, f_alpha.pixels_size);
+        ppf->frames[f].extra_channels.emplace_back(std::move(f_alpha));
+      }
+    }
+  }
+
   // 3. Delta optimization pipeline
   ppf->frames[0].frame_info.layer_info.have_crop = 0;
   ppf->frames[0].frame_info.layer_info.crop_x0 = 0;
