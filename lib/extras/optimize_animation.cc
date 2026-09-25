@@ -544,22 +544,50 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
       cropped.extra_channels.emplace_back(std::move(cropped_ec));
     }
 
+    std::vector<uint8_t> diff_map;
+    if (can_use_blend) {
+      diff_map.resize(w * h);
+      for (size_t y = 0; y < h; ++y) {
+        size_t cy = y0 + y;
+        const uint8_t* c_color_row =
+            static_cast<const uint8_t*>(canvas.color.pixels()) +
+            cy * canvas.color.stride;
+        const uint8_t* f_color_row =
+            static_cast<const uint8_t*>(curr_frame.color.pixels()) +
+            cy * curr_frame.color.stride;
+        const uint8_t* c_alpha_row =
+            has_extra_channel_alpha ? (static_cast<const uint8_t*>(
+                                           canvas.extra_channels[0].pixels()) +
+                                       cy * canvas.extra_channels[0].stride)
+                                    : nullptr;
+        const uint8_t* f_alpha_row =
+            has_extra_channel_alpha
+                ? (static_cast<const uint8_t*>(
+                       curr_frame.extra_channels[0].pixels()) +
+                   cy * curr_frame.extra_channels[0].stride)
+                : nullptr;
+        for (size_t x = 0; x < w; ++x) {
+          size_t cx = x0 + x;
+          bool diff = (memcmp(c_color_row + cx * color_pixel_stride,
+                              f_color_row + cx * color_pixel_stride,
+                              color_pixel_stride) != 0 ||
+                       (has_extra_channel_alpha &&
+                        memcmp(c_alpha_row + cx * alpha_pixel_stride,
+                               f_alpha_row + cx * alpha_pixel_stride,
+                               alpha_pixel_stride) != 0));
+          diff_map[y * w + x] = diff ? 1 : 0;
+        }
+      }
+    }
+
     for (size_t y = 0; y < h; ++y) {
       size_t cy = y0 + y;
-      const uint8_t* c_color_row =
-          static_cast<const uint8_t*>(canvas.color.pixels()) +
-          cy * canvas.color.stride;
       const uint8_t* f_color_row =
           static_cast<const uint8_t*>(curr_frame.color.pixels()) +
           cy * curr_frame.color.stride;
       uint8_t* dst_color_row = static_cast<uint8_t*>(cropped.color.pixels()) +
                                y * cropped.color.stride;
 
-      const uint8_t* c_alpha_row =
-          has_extra_channel_alpha ? (static_cast<const uint8_t*>(
-                                         canvas.extra_channels[0].pixels()) +
-                                     cy * canvas.extra_channels[0].stride)
-                                  : nullptr;
       const uint8_t* f_alpha_row =
           has_extra_channel_alpha
               ? (static_cast<const uint8_t*>(
@@ -574,16 +602,29 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
 
       for (size_t x = 0; x < w; ++x) {
         size_t cx = x0 + x;
-        bool diff = false;
-        if (memcmp(c_color_row + cx * color_pixel_stride,
-                   f_color_row + cx * color_pixel_stride,
-                   color_pixel_stride) != 0) {
-          diff = true;
-        } else if (has_extra_channel_alpha &&
-                   memcmp(c_alpha_row + cx * alpha_pixel_stride,
-                          f_alpha_row + cx * alpha_pixel_stride,
-                          alpha_pixel_stride) != 0) {
-          diff = true;
+        bool diff = can_use_blend ? diff_map[y * w + x] : true;
+        if (!diff) {
+          int matching_neighbors = 0;
+          int total_neighbors = 0;
+          if (x > 0) {
+            ++total_neighbors;
+            if (!diff_map[y * w + (x - 1)]) ++matching_neighbors;
+          }
+          if (x + 1 < w) {
+            ++total_neighbors;
+            if (!diff_map[y * w + (x + 1)]) ++matching_neighbors;
+          }
+          if (y > 0) {
+            ++total_neighbors;
+            if (!diff_map[(y - 1) * w + x]) ++matching_neighbors;
+          }
+          if (y + 1 < h) {
+            ++total_neighbors;
+            if (!diff_map[(y + 1) * w + x]) ++matching_neighbors;
+          }
+          if (total_neighbors - matching_neighbors > 1) {
+            diff = true;
+          }
         }
 
         if (can_use_blend && !diff) {
