@@ -18,6 +18,7 @@
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/chroma_from_luma.h"
 #include "lib/jxl/coeff_order.h"
 #include "lib/jxl/coeff_order_fwd.h"
 #include "lib/jxl/common.h"
@@ -25,7 +26,10 @@
 #include "lib/jxl/enc_ans.h"
 #include "lib/jxl/enc_ans_params.h"
 #include "lib/jxl/enc_bit_writer.h"
+#include "lib/jxl/enc_coeff_order.h"
 #include "lib/jxl/frame_dimensions.h"
+#include "lib/jxl/frame_header.h"
+#include "lib/jxl/jpeg/jpeg_data.h"
 #include "lib/jxl/lehmer_code.h"
 #include "lib/jxl/memory_manager_internal.h"
 
@@ -63,95 +67,13 @@ std::pair<uint32_t, uint32_t> ComputeUsedOrders(
   return {ret, ret_customize};
 }
 
-Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
-                         const AcStrategyImage& ac_strategy,
-                         const FrameDimensions& frame_dim,
-                         uint32_t& all_used_orders, uint32_t prev_used_acs,
-                         uint32_t current_used_acs,
-                         uint32_t current_used_orders,
-                         coeff_order_t* JXL_RESTRICT order) {
-  JxlMemoryManager* memory_manager = ac_strategy.memory_manager();
-  std::vector<int64_t> num_zeros(kCoeffOrderMaxSize);
-  // If compressing at high speed and only using 8x8 DCTs, only consider a
-  // subset of blocks.
-  double block_fraction = 1.0f;
-  // TODO(veluca): figure out why sampling blocks if non-8x8s are used makes
-  // encoding significantly less dense.
-  if (speed >= SpeedTier::kSquirrel && current_used_orders == 1) {
-    block_fraction = 0.5f;
-  }
-  // No need to compute number of zero coefficients if all orders are the
-  // default.
-  if (current_used_orders != 0) {
-    uint64_t threshold =
-        (std::numeric_limits<uint64_t>::max() >> 32) * block_fraction;
-    uint64_t s[2] = {static_cast<uint64_t>(0x94D049BB133111EBull),
-                     static_cast<uint64_t>(0xBF58476D1CE4E5B9ull)};
-    // Xorshift128+ adapted from xorshift128+-inl.h
-    auto use_sample = [&]() {
-      auto s1 = s[0];
-      const auto s0 = s[1];
-      const auto bits = s1 + s0;  // b, c
-      s[0] = s0;
-      s1 ^= s1 << 23;
-      s1 ^= s0 ^ (s1 >> 18) ^ (s0 >> 5);
-      s[1] = s1;
-      return (bits >> 32) <= threshold;
-    };
-
-    // Count number of zero coefficients, separately for each DCT band.
-    // TODO(veluca): precompute when doing DCT.
-    for (size_t group_index = 0; group_index < frame_dim.num_groups;
-         group_index++) {
-      const size_t gx = group_index % frame_dim.xsize_groups;
-      const size_t gy = group_index / frame_dim.xsize_groups;
-      const Rect rect(gx * kGroupDimInBlocks, gy * kGroupDimInBlocks,
-                      kGroupDimInBlocks, kGroupDimInBlocks,
-                      frame_dim.xsize_blocks, frame_dim.ysize_blocks);
-      ConstACPtr rows[3];
-      ACType type = ac_image.Type();
-      for (size_t c = 0; c < 3; c++) {
-        rows[c] = ac_image.PlaneRow(c, group_index, 0);
-      }
-      size_t ac_offset = 0;
-
-      // TODO(veluca): SIMDfy.
-      for (size_t by = 0; by < rect.ysize(); ++by) {
-        AcStrategyRow acs_row = ac_strategy.ConstRow(rect, by);
-        for (size_t bx = 0; bx < rect.xsize(); ++bx) {
-          AcStrategy acs = acs_row[bx];
-          if (!acs.IsFirstBlock()) continue;
-          if (!use_sample()) continue;
-          size_t size = kDCTBlockSize << acs.log2_covered_blocks();
-          for (size_t c = 0; c < 3; ++c) {
-            const size_t order_offset =
-                CoeffOrderOffset(kStrategyOrder[acs.RawStrategy()], c);
-            if (type == ACType::k16) {
-              for (size_t k = 0; k < size; k++) {
-                bool is_zero = rows[c].ptr16[ac_offset + k] == 0;
-                num_zeros[order_offset + k] += is_zero ? 1 : 0;
-              }
-            } else {
-              for (size_t k = 0; k < size; k++) {
-                bool is_zero = rows[c].ptr32[ac_offset + k] == 0;
-                num_zeros[order_offset + k] += is_zero ? 1 : 0;
-              }
-            }
-            // Ensure LLFs are first in the order.
-            size_t cx = acs.covered_blocks_x();
-            size_t cy = acs.covered_blocks_y();
-            CoefficientLayout(&cy, &cx);
-            for (size_t iy = 0; iy < cy; iy++) {
-              for (size_t ix = 0; ix < cx; ix++) {
-                num_zeros[order_offset + iy * kBlockDim * cx + ix] = -1;
-              }
-            }
-          }
-          ac_offset += size;
-        }
-      }
-    }
-  }
+Status FinalizeCoeffOrderFromNumZeros(
+    JxlMemoryManager* memory_manager,
+    const std::vector<int64_t>& num_zeros,
+    uint32_t& all_used_orders, uint32_t prev_used_acs,
+    uint32_t current_used_acs,
+    uint32_t current_used_orders,
+    coeff_order_t* JXL_RESTRICT order) {
   struct PosAndCount {
     uint32_t pos;
     // Saving index breaks the ties for non-stable sort
@@ -234,6 +156,224 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
   }
   all_used_orders |= current_used_orders;
   return true;
+}
+
+Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
+                         const AcStrategyImage& ac_strategy,
+                         const FrameDimensions& frame_dim,
+                         uint32_t& all_used_orders, uint32_t prev_used_acs,
+                         uint32_t current_used_acs,
+                         uint32_t current_used_orders,
+                         coeff_order_t* JXL_RESTRICT order,
+                         const YCbCrChromaSubsampling& cs) {
+  JxlMemoryManager* memory_manager = ac_strategy.memory_manager();
+  std::vector<int64_t> num_zeros(kCoeffOrderMaxSize);
+  // If compressing at high speed and only using 8x8 DCTs, only consider a
+  // subset of blocks.
+  double block_fraction = 1.0f;
+  // TODO(veluca): figure out why sampling blocks if non-8x8s are used makes
+  // encoding significantly less dense.
+  if (speed >= SpeedTier::kSquirrel && current_used_orders == 1) {
+    block_fraction = 0.5f;
+  }
+  // No need to compute number of zero coefficients if all orders are the
+  // default.
+  if (current_used_orders != 0) {
+    uint64_t threshold =
+        (std::numeric_limits<uint64_t>::max() >> 32) * block_fraction;
+    uint64_t s[2] = {static_cast<uint64_t>(0x94D049BB133111EBull),
+                     static_cast<uint64_t>(0xBF58476D1CE4E5B9ull)};
+    // Xorshift128+ adapted from xorshift128+-inl.h
+    auto use_sample = [&]() {
+      auto s1 = s[0];
+      const auto s0 = s[1];
+      const auto bits = s1 + s0;  // b, c
+      s[0] = s0;
+      s1 ^= s1 << 23;
+      s1 ^= s0 ^ (s1 >> 18) ^ (s0 >> 5);
+      s[1] = s1;
+      return (bits >> 32) <= threshold;
+    };
+
+    // Count number of zero coefficients, separately for each DCT band.
+    // TODO(veluca): precompute when doing DCT.
+    for (size_t group_index = 0; group_index < frame_dim.num_groups;
+         group_index++) {
+      const size_t gx = group_index % frame_dim.xsize_groups;
+      const size_t gy = group_index / frame_dim.xsize_groups;
+      const Rect rect(gx * kGroupDimInBlocks, gy * kGroupDimInBlocks,
+                      kGroupDimInBlocks, kGroupDimInBlocks,
+                      frame_dim.xsize_blocks, frame_dim.ysize_blocks);
+      ConstACPtr rows[3];
+      ACType type = ac_image.Type();
+      for (size_t c = 0; c < 3; c++) {
+        rows[c] = ac_image.PlaneRow(c, group_index, 0);
+      }
+      size_t ac_offset[3] = {};
+
+      // TODO(veluca): SIMDfy.
+      for (size_t by = 0; by < rect.ysize(); ++by) {
+        AcStrategyRow acs_row = ac_strategy.ConstRow(rect, by);
+        for (size_t bx = 0; bx < rect.xsize(); ++bx) {
+          AcStrategy acs = acs_row[bx];
+          if (!acs.IsFirstBlock()) continue;
+          bool sample = use_sample();
+          size_t size = kDCTBlockSize << acs.log2_covered_blocks();
+          for (size_t c = 0; c < 3; ++c) {
+            if ((bx >> cs.HShift(c)) << cs.HShift(c) != bx) continue;
+            if ((by >> cs.VShift(c)) << cs.VShift(c) != by) continue;
+            if (sample) {
+              const size_t order_offset =
+                  CoeffOrderOffset(kStrategyOrder[acs.RawStrategy()], c);
+              if (type == ACType::k16) {
+                for (size_t k = 0; k < size; k++) {
+                  bool is_zero = rows[c].ptr16[ac_offset[c] + k] == 0;
+                  num_zeros[order_offset + k] += is_zero ? 1 : 0;
+                }
+              } else {
+                for (size_t k = 0; k < size; k++) {
+                  bool is_zero = rows[c].ptr32[ac_offset[c] + k] == 0;
+                  num_zeros[order_offset + k] += is_zero ? 1 : 0;
+                }
+              }
+              // Ensure LLFs are first in the order.
+              size_t cx = acs.covered_blocks_x();
+              size_t cy = acs.covered_blocks_y();
+              CoefficientLayout(&cy, &cx);
+              for (size_t iy = 0; iy < cy; iy++) {
+                for (size_t ix = 0; ix < cx; ix++) {
+                  num_zeros[order_offset + iy * kBlockDim * cx + ix] = -1;
+                }
+              }
+            }
+            ac_offset[c] += size;
+          }
+        }
+      }
+    }
+  }
+  return FinalizeCoeffOrderFromNumZeros(
+      memory_manager, num_zeros, all_used_orders, prev_used_acs,
+      current_used_acs, current_used_orders, order);
+}
+
+Status ComputeCoeffOrderJPEG(
+    SpeedTier speed, const jpeg::JPEGData& jpeg_data,
+    const FrameHeader& frame_header,
+    const FrameDimensions& frame_dim,
+    uint32_t& all_used_orders, uint32_t prev_used_acs,
+    uint32_t current_used_acs,
+    uint32_t current_used_orders,
+    coeff_order_t* JXL_RESTRICT order,
+    const ColorCorrelationMap* cmap,
+    const std::vector<int32_t>& scaled_qtable,
+    bool force_cfl, JxlMemoryManager* memory_manager) {
+  std::vector<int64_t> num_zeros(kCoeffOrderMaxSize, 0);
+  double block_fraction = 1.0f;
+  if (speed >= SpeedTier::kSquirrel && current_used_orders == 1) {
+    block_fraction = 0.5f;
+  }
+  if (current_used_orders != 0) {
+    uint64_t threshold =
+        (std::numeric_limits<uint64_t>::max() >> 32) * block_fraction;
+    uint64_t s[2] = {static_cast<uint64_t>(0x94D049BB133111EBull),
+                     static_cast<uint64_t>(0xBF58476D1CE4E5B9ull)};
+    auto use_sample = [&]() {
+      auto s1 = s[0];
+      const auto s0 = s[1];
+      const auto bits = s1 + s0;
+      s[0] = s0;
+      s1 ^= s1 << 23;
+      s1 ^= s0 ^ (s1 >> 18) ^ (s0 >> 5);
+      s[1] = s1;
+      return (bits >> 32) <= threshold;
+    };
+
+    auto jpeg_c_map =
+        JpegOrder(frame_header.color_transform, jpeg_data.components.size() == 1);
+    const YCbCrChromaSubsampling& cs = frame_header.chroma_subsampling;
+
+    for (size_t group_index = 0; group_index < frame_dim.num_groups;
+         group_index++) {
+      const size_t gx = group_index % frame_dim.xsize_groups;
+      const size_t gy = group_index / frame_dim.xsize_groups;
+      const Rect rect(gx * kGroupDimInBlocks, gy * kGroupDimInBlocks,
+                      kGroupDimInBlocks, kGroupDimInBlocks,
+                      frame_dim.xsize_blocks, frame_dim.ysize_blocks);
+
+      for (size_t by = 0; by < rect.ysize(); ++by) {
+        for (size_t bx = 0; bx < rect.xsize(); ++bx) {
+          bool sample = use_sample();
+          for (size_t c = 0; c < 3; ++c) {
+            if ((bx >> cs.HShift(c)) << cs.HShift(c) != bx) continue;
+            if ((by >> cs.VShift(c)) << cs.VShift(c) != by) continue;
+            if (sample) {
+              const size_t order_offset = CoeffOrderOffset(0, c);
+              if (jpeg_data.components.size() == 1 && c != 1) {
+                for (size_t k = 0; k < 64; k++) {
+                  num_zeros[order_offset + k]++;
+                }
+                num_zeros[order_offset] = -1;
+                continue;
+              }
+              size_t block_x = (rect.x0() + bx) >> cs.HShift(c);
+              size_t block_y = (rect.y0() + by) >> cs.VShift(c);
+              size_t jpeg_c = jpeg_c_map[c];
+              const auto& comp = jpeg_data.components[jpeg_c];
+              const int16_t* inputjpeg =
+                  comp.coeffs.data() +
+                  (block_y * comp.width_in_blocks + block_x) * kDCTBlockSize;
+              if (c == 1 || !force_cfl || !cs.Is444() || cmap == nullptr) {
+                for (size_t y = 0; y < 8; y++) {
+                  for (size_t x = 0; x < 8; x++) {
+                    bool is_zero = (inputjpeg[y * 8 + x] == 0);
+                    num_zeros[order_offset + x * 8 + y] += is_zero ? 1 : 0;
+                  }
+                }
+              } else {
+                size_t jpeg_y_c = jpeg_c_map[1];
+                const auto& compY = jpeg_data.components[jpeg_y_c];
+                const int16_t* inputjpegY =
+                    compY.coeffs.data() +
+                    (block_y * compY.width_in_blocks + block_x) * kDCTBlockSize;
+                const ImageSB& map =
+                    (c == 0 ? cmap->ytox_map : cmap->ytob_map);
+                const int8_t* cm =
+                    map.ConstRow((rect.y0() + by) / kColorTileDimInBlocks);
+                const int32_t scale = ColorCorrelation::RatioJPEG(
+                    cm[(rect.x0() + bx) / kColorTileDimInBlocks]);
+                for (size_t y = 0; y < 8; y++) {
+                  for (size_t x = 0; x < 8; x++) {
+                    int coeffpos = y * 8 + x;
+                    int Y = inputjpegY[coeffpos];
+                    int QChroma = inputjpeg[coeffpos];
+                    int coeff_scale =
+                        (scale * scaled_qtable[kDCTBlockSize * c + coeffpos] +
+                         (1 << (kCFLFixedPointPrecision - 1))) >>
+                        kCFLFixedPointPrecision;
+                    int cfl_factor =
+                        (Y * coeff_scale +
+                         (1 << (kCFLFixedPointPrecision - 1))) >>
+                        kCFLFixedPointPrecision;
+                    int QCR = QChroma - cfl_factor;
+                    int16_t val =
+                        static_cast<int16_t>(Clamp1(-32768, QCR, 32767));
+                    bool is_zero = (val == 0);
+                    num_zeros[order_offset + x * 8 + y] += is_zero ? 1 : 0;
+                  }
+                }
+              }
+              num_zeros[order_offset] = -1;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return FinalizeCoeffOrderFromNumZeros(
+      memory_manager, num_zeros, all_used_orders, prev_used_acs,
+      current_used_acs, current_used_orders, order);
 }
 
 namespace {

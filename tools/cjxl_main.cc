@@ -1127,6 +1127,8 @@ int main(int argc, char** argv) {
         std::cerr << "No frames on input file.\n";
         exit(EXIT_FAILURE);
       }
+      image_data.clear();
+      image_data.shrink_to_fit();
       pixels = static_cast<size_t>(ppf.info.xsize) * ppf.info.ysize;
       const double t1 = jxl::Now();
       decode_mps = pixels * ppf.info.num_color_channels * 1E-6 / (t1 - t0);

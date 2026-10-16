@@ -18,6 +18,7 @@
 #include "lib/jxl/dct_util.h"
 #include "lib/jxl/enc_bit_writer.h"
 #include "lib/jxl/frame_dimensions.h"
+#include "lib/jxl/frame_header.h"
 
 namespace jxl {
 
@@ -39,7 +40,25 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& acs,
                          uint32_t& all_used_orders, uint32_t prev_used_acs,
                          uint32_t current_used_acs,
                          uint32_t current_used_orders,
-                         coeff_order_t* JXL_RESTRICT order);
+                         coeff_order_t* JXL_RESTRICT order,
+                         const YCbCrChromaSubsampling& cs = {});
+
+namespace jpeg {
+struct JPEGData;
+}
+struct ColorCorrelationMap;
+
+Status ComputeCoeffOrderJPEG(
+    SpeedTier speed, const jpeg::JPEGData& jpeg_data,
+    const FrameHeader& frame_header,
+    const FrameDimensions& frame_dim,
+    uint32_t& all_used_orders, uint32_t prev_used_acs,
+    uint32_t current_used_acs,
+    uint32_t current_used_orders,
+    coeff_order_t* JXL_RESTRICT order,
+    const ColorCorrelationMap* cmap,
+    const std::vector<int32_t>& scaled_qtable,
+    bool force_cfl, JxlMemoryManager* memory_manager);
 
 Status EncodeCoeffOrders(uint16_t used_orders,
                          const coeff_order_t* JXL_RESTRICT order,

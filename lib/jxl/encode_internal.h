@@ -273,6 +273,14 @@ class JxlEncoderChunkedFrameAdapter {
 
   bool StreamingInput() const { return has_input_source_; }
 
+  void ReleaseBuffers() {
+    channels_.clear();
+    channels_.shrink_to_fit();
+    has_input_source_ = false;
+    input_source_ = {};
+    jpeg_data_.reset();
+  }
+
   const size_t xsize;
   const size_t ysize;
 

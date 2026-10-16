@@ -38,6 +38,16 @@ Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
                             const ImageB& qdc, const ImageI& qf,
                             const BlockCtxMap& block_ctx_map);
 
+Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
+                            const Rect& rect,
+                            const int16_t* JXL_RESTRICT* JXL_RESTRICT ac_rows,
+                            const AcStrategyImage& ac_strategy,
+                            const YCbCrChromaSubsampling& cs,
+                            Image3I* JXL_RESTRICT tmp_num_nzeroes,
+                            std::vector<Token>* JXL_RESTRICT output,
+                            const ImageB& qdc, const ImageI& qf,
+                            const BlockCtxMap& block_ctx_map);
+
 }  // namespace jxl
 
 #endif  // LIB_JXL_ENC_ENTROPY_CODER_H_

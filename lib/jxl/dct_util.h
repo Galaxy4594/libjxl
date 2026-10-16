@@ -57,12 +57,22 @@ class ACImageT final : public ACImage {
 
   static StatusOr<std::unique_ptr<ACImageT>> Make(
       JxlMemoryManager* memory_manager, size_t xsize, size_t ysize) {
+    return Make(memory_manager, xsize, xsize, xsize, ysize);
+  }
+
+  static StatusOr<std::unique_ptr<ACImageT>> Make(
+      JxlMemoryManager* memory_manager, size_t xsize0, size_t xsize1,
+      size_t xsize2, size_t ysize) {
     static_assert(
         std::is_same<T, int16_t>::value || std::is_same<T, int32_t>::value,
         "ACImage must be either 32- or 16- bit");
     std::unique_ptr<ACImageT> result = jxl::make_unique<ACImageT>();
-    JXL_ASSIGN_OR_RETURN(result->img_,
-                         Image3<T>::Create(memory_manager, xsize, ysize));
+    JXL_ASSIGN_OR_RETURN(result->planes_[0],
+                         Plane<T>::Create(memory_manager, xsize0, ysize));
+    JXL_ASSIGN_OR_RETURN(result->planes_[1],
+                         Plane<T>::Create(memory_manager, xsize1, ysize));
+    JXL_ASSIGN_OR_RETURN(result->planes_[2],
+                         Plane<T>::Create(memory_manager, xsize2, ysize));
     return result;
   }
 
@@ -70,24 +80,28 @@ class ACImageT final : public ACImage {
     return sizeof(T) == 2 ? ACType::k16 : ACType::k32;
   }
   ACPtr PlaneRow(size_t c, size_t y, size_t xbase) override {
-    return ACPtr(img_.PlaneRow(c, y) + xbase);
+    return ACPtr(planes_[c].Row(y) + xbase);
   }
   ConstACPtr PlaneRow(size_t c, size_t y, size_t xbase) const override {
-    return ConstACPtr(img_.PlaneRow(c, y) + xbase);
+    return ConstACPtr(planes_[c].Row(y) + xbase);
   }
 
-  size_t PixelsPerRow() const override { return img_.PixelsPerRow(); }
+  size_t PixelsPerRow() const override { return planes_[0].PixelsPerRow(); }
 
-  void ZeroFill() override { ZeroFillImage(&img_); }
+  void ZeroFill() override {
+    ZeroFillImage(&planes_[0]);
+    ZeroFillImage(&planes_[1]);
+    ZeroFillImage(&planes_[2]);
+  }
 
-  void ZeroFillPlane(size_t c) override { ZeroFillImage(&img_.Plane(c)); }
+  void ZeroFillPlane(size_t c) override { ZeroFillImage(&planes_[c]); }
 
   bool IsEmpty() const override {
-    return img_.xsize() == 0 || img_.ysize() == 0;
+    return planes_[0].xsize() == 0 || planes_[0].ysize() == 0;
   }
 
  private:
-  Image3<T> img_;
+  Plane<T> planes_[3];
 };
 
 }  // namespace jxl
