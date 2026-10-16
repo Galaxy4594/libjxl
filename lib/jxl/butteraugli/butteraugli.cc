@@ -544,13 +544,12 @@ void DeallocateHFAndUHF(ImageF* hf, ImageF* uhf) {
 
 Status SeparateFrequencies(size_t xsize, size_t ysize,
                            const ButteraugliParams& params, BlurTemp* blur_temp,
-                           const Image3F& xyb, PsychoImage& ps) {
-  JxlMemoryManager* memory_manager = xyb.memory_manager();
+                           Image3F* xyb, PsychoImage& ps) {
+  JxlMemoryManager* memory_manager = xyb->memory_manager();
   JXL_ASSIGN_OR_RETURN(
-      ps.lf, Image3F::Create(memory_manager, xyb.xsize(), xyb.ysize()));
-  JXL_ASSIGN_OR_RETURN(
-      ps.mf, Image3F::Create(memory_manager, xyb.xsize(), xyb.ysize()));
-  JXL_RETURN_IF_ERROR(SeparateLFAndMF(params, xyb, &ps.lf, &ps.mf, blur_temp));
+      ps.lf, Image3F::Create(memory_manager, xyb->xsize(), xyb->ysize()));
+  ps.mf = std::move(*xyb);
+  JXL_RETURN_IF_ERROR(SeparateLFAndMF(params, ps.mf, &ps.lf, &ps.mf, blur_temp));
   JXL_RETURN_IF_ERROR(SeparateMFAndHF(params, &ps.mf, &ps.hf[0], blur_temp));
   JXL_RETURN_IF_ERROR(
       SeparateHFAndUHF(params, &ps.hf[0], &ps.uhf[0], blur_temp));
@@ -1139,8 +1138,8 @@ void DiffPrecompute(const ImageF& xyb, float mul, float bias_arg, ImageF* out) {
   const float bias = mul * bias_arg;
   const float sqrt_bias = std::sqrt(bias);
   for (size_t y = 0; y < ysize; ++y) {
-    const float* BUTTERAUGLI_RESTRICT row_in = xyb.Row(y);
-    float* BUTTERAUGLI_RESTRICT row_out = out->Row(y);
+    const float* row_in = xyb.Row(y);
+    float* row_out = out->Row(y);
     for (size_t x = 0; x < xsize; ++x) {
       // kBias makes sqrt behave more linearly.
       row_out[x] = std::sqrt(mul * std::abs(row_in[x]) + bias) - sqrt_bias;
@@ -1211,7 +1210,7 @@ void FuzzyErosion(const ImageF& from, ImageF* to) {
 
 // Compute values of local frequency and dc masking based on the activity
 // in the two images. img_diff_ac may be null.
-Status Mask(const ImageF& mask0, const ImageF& mask1,
+Status Mask(ImageF& mask0, ImageF& mask1,
             const ButteraugliParams& params, BlurTemp* blur_temp,
             ImageF* BUTTERAUGLI_RESTRICT mask,
             ImageF* BUTTERAUGLI_RESTRICT diff_ac) {
@@ -1222,29 +1221,26 @@ Status Mask(const ImageF& mask0, const ImageF& mask1,
   static const float kMul = 6.19424080439;
   static const float kBias = 12.61050594197;
   static const float kRadius = 2.7;
-  JXL_ASSIGN_OR_RETURN(ImageF diff0,
-                       ImageF::Create(memory_manager, xsize, ysize));
-  JXL_ASSIGN_OR_RETURN(ImageF diff1,
-                       ImageF::Create(memory_manager, xsize, ysize));
-  JXL_ASSIGN_OR_RETURN(ImageF blurred0,
-                       ImageF::Create(memory_manager, xsize, ysize));
-  JXL_ASSIGN_OR_RETURN(ImageF blurred1,
-                       ImageF::Create(memory_manager, xsize, ysize));
-  DiffPrecompute(mask0, kMul, kBias, &diff0);
-  DiffPrecompute(mask1, kMul, kBias, &diff1);
-  JXL_RETURN_IF_ERROR(Blur(diff0, kRadius, params, blur_temp, &blurred0));
-  FuzzyErosion(blurred0, &diff0);
-  JXL_RETURN_IF_ERROR(Blur(diff1, kRadius, params, blur_temp, &blurred1));
-  for (size_t y = 0; y < ysize; ++y) {
-    for (size_t x = 0; x < xsize; ++x) {
-      mask->Row(y)[x] = diff0.Row(y)[x];
-      if (diff_ac != nullptr) {
-        static const float kMaskToErrorMul = 10.0;
-        float diff = blurred0.Row(y)[x] - blurred1.Row(y)[x];
-        diff_ac->Row(y)[x] += kMaskToErrorMul * diff * diff;
+  DiffPrecompute(mask0, kMul, kBias, &mask0);
+  DiffPrecompute(mask1, kMul, kBias, &mask1);
+  JXL_RETURN_IF_ERROR(Blur(mask0, kRadius, params, blur_temp, mask));
+  FuzzyErosion(*mask, &mask0);
+  if (diff_ac != nullptr) {
+    JXL_ASSIGN_OR_RETURN(ImageF blurred1,
+                         ImageF::Create(memory_manager, xsize, ysize));
+    JXL_RETURN_IF_ERROR(Blur(mask1, kRadius, params, blur_temp, &blurred1));
+    static const float kMaskToErrorMul = 10.0;
+    for (size_t y = 0; y < ysize; ++y) {
+      const float* row_b0 = mask->Row(y);
+      const float* row_b1 = blurred1.Row(y);
+      float* row_dac = diff_ac->Row(y);
+      for (size_t x = 0; x < xsize; ++x) {
+        float diff = row_b0[x] - row_b1[x];
+        row_dac[x] += kMaskToErrorMul * diff * diff;
       }
     }
   }
+  *mask = std::move(mask0);
   return true;
 }
 
@@ -1340,16 +1336,16 @@ static void L2Diff(const ImageF& i0, const ImageF& i1, const float w,
 
 // Initializes diffmap to the weighted L2 difference between i0 and i1.
 static void SetL2Diff(const ImageF& i0, const ImageF& i1, const float w,
-                      ImageF* BUTTERAUGLI_RESTRICT diffmap) {
+                      ImageF* diffmap) {
   if (w == 0) return;
 
   const HWY_FULL(float) d;
   const auto weight = Set(d, w);
 
   for (size_t y = 0; y < i0.ysize(); ++y) {
-    const float* BUTTERAUGLI_RESTRICT row0 = i0.ConstRow(y);
-    const float* BUTTERAUGLI_RESTRICT row1 = i1.ConstRow(y);
-    float* BUTTERAUGLI_RESTRICT row_diff = diffmap->Row(y);
+    const float* row0 = i0.ConstRow(y);
+    const float* row1 = i1.ConstRow(y);
+    float* row_diff = diffmap->Row(y);
 
     for (size_t x = 0; x < i0.xsize(); x += Lanes(d)) {
       const auto diff = Sub(Load(d, row0 + x), Load(d, row1 + x));
@@ -1810,7 +1806,7 @@ StatusOr<std::unique_ptr<ButteraugliComparator>> ButteraugliComparator::Make(
       rgb0, params, result->Temp(), &result->blur_temp_, &xyb0));
   result->ReleaseTemp();
   JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(SeparateFrequencies)(
-      xsize, ysize, params, &result->blur_temp_, xyb0, result->pi0_));
+      xsize, ysize, params, &result->blur_temp_, &xyb0, result->pi0_));
 
   // Awful recursive construction of samples of different resolution.
   // This is an after-thought and possibly somewhat parallel in
@@ -1838,7 +1834,7 @@ Status ButteraugliComparator::Diffmap(const Image3F& rgb1,
   JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(OpsinDynamicsImage)(
       rgb1, params_, Temp(), &blur_temp_, &xyb1));
   ReleaseTemp();
-  JXL_RETURN_IF_ERROR(DiffmapOpsinDynamicsImage(xyb1, result));
+  JXL_RETURN_IF_ERROR(DiffmapOpsinDynamicsImage(std::move(xyb1), result));
   if (sub_) {
     if (sub_->xsize_ < 8 || sub_->ysize_ < 8) {
       return true;
@@ -1850,8 +1846,10 @@ Status ButteraugliComparator::Diffmap(const Image3F& rgb1,
     JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(OpsinDynamicsImage)(
         subsampledRgb1, params_, sub_->Temp(), &sub_->blur_temp_, &sub_xyb));
     sub_->ReleaseTemp();
+    subsampledRgb1 = Image3F();
     ImageF subresult;
-    JXL_RETURN_IF_ERROR(sub_->DiffmapOpsinDynamicsImage(sub_xyb, subresult));
+    JXL_RETURN_IF_ERROR(
+        sub_->DiffmapOpsinDynamicsImage(std::move(sub_xyb), subresult));
     AddSupersampled2x(subresult, 0.5, result);
   }
   return true;
@@ -1864,11 +1862,24 @@ Status ButteraugliComparator::DiffmapOpsinDynamicsImage(const Image3F& xyb1,
     ZeroFillImage(&result);
     return true;
   }
+  Image3F copy;
+  JXL_ASSIGN_OR_RETURN(copy, Image3F::Create(memory_manager, xsize_, ysize_));
+  JXL_RETURN_IF_ERROR(CopyImageTo(xyb1, &copy));
+  return DiffmapOpsinDynamicsImage(std::move(copy), result);
+}
+
+Status ButteraugliComparator::DiffmapOpsinDynamicsImage(Image3F&& xyb1,
+                                                        ImageF& result) const {
+  JxlMemoryManager* memory_manager = xyb1.memory_manager();
+  if (xsize_ < 8 || ysize_ < 8) {
+    ZeroFillImage(&result);
+    return true;
+  }
   PsychoImage pi1;
   JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(SeparateFrequencies)(
-      xsize_, ysize_, params_, &blur_temp_, xyb1, pi1));
+      xsize_, ysize_, params_, &blur_temp_, &xyb1, pi1));
   JXL_ASSIGN_OR_RETURN(result, ImageF::Create(memory_manager, xsize_, ysize_));
-  return DiffmapPsychoImage(pi1, result);
+  return DiffmapPsychoImage(&pi1, result);
 }
 
 namespace {
@@ -1894,6 +1905,27 @@ Status MaltaDiffMapLF(const ImageF& lum0, const ImageF& lum1,
 Status ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
                                                  ImageF& diffmap) const {
   JxlMemoryManager* memory_manager = diffmap.memory_manager();
+  PsychoImage pi1_copy;
+  JXL_ASSIGN_OR_RETURN(pi1_copy.lf,
+                       Image3F::Create(memory_manager, xsize_, ysize_));
+  JXL_RETURN_IF_ERROR(CopyImageTo(pi1.lf, &pi1_copy.lf));
+  JXL_ASSIGN_OR_RETURN(pi1_copy.mf,
+                       Image3F::Create(memory_manager, xsize_, ysize_));
+  JXL_RETURN_IF_ERROR(CopyImageTo(pi1.mf, &pi1_copy.mf));
+  for (int i = 0; i < 2; ++i) {
+    JXL_ASSIGN_OR_RETURN(pi1_copy.hf[i],
+                         ImageF::Create(memory_manager, xsize_, ysize_));
+    JXL_RETURN_IF_ERROR(CopyImageTo(pi1.hf[i], &pi1_copy.hf[i]));
+    JXL_ASSIGN_OR_RETURN(pi1_copy.uhf[i],
+                         ImageF::Create(memory_manager, xsize_, ysize_));
+    JXL_RETURN_IF_ERROR(CopyImageTo(pi1.uhf[i], &pi1_copy.uhf[i]));
+  }
+  return DiffmapPsychoImage(&pi1_copy, diffmap);
+}
+
+Status ButteraugliComparator::DiffmapPsychoImage(PsychoImage* pi1,
+                                                 ImageF& diffmap) const {
+  JxlMemoryManager* memory_manager = diffmap.memory_manager();
   if (xsize_ < 8 || ysize_ < 8) {
     ZeroFillImage(&diffmap);
     return true;
@@ -1904,51 +1936,77 @@ Status ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
 
   JXL_ASSIGN_OR_RETURN(ImageF diffs,
                        ImageF::Create(memory_manager, xsize_, ysize_));
-  JXL_ASSIGN_OR_RETURN(Image3F block_diff_ac,
-                       Image3F::Create(memory_manager, xsize_, ysize_));
-  ZeroFillImage(&block_diff_ac);
+
+  // Reuse temp_ for block_diff_ac if available to save 3 full planes.
+  Image3F* block_diff_ac = Temp();
+  Image3F block_diff_ac_storage;
+  bool using_temp = (block_diff_ac != nullptr);
+  if (!using_temp) {
+    JXL_ASSIGN_OR_RETURN(block_diff_ac_storage,
+                         Image3F::Create(memory_manager, xsize_, ysize_));
+    block_diff_ac = &block_diff_ac_storage;
+  }
+  struct TempGuard {
+    const ButteraugliComparator* c;
+    bool active;
+    ~TempGuard() {
+      if (active) c->ReleaseTemp();
+    }
+  } temp_guard{this, using_temp};
+  ZeroFillImage(block_diff_ac);
+
   JXL_RETURN_IF_ERROR(MaltaDiffMap(
-      pi0_.uhf[1], pi1.uhf[1], wUhfMalta * hf_asymmetry_,
-      wUhfMalta / hf_asymmetry_, norm1Uhf, &diffs, &block_diff_ac, 1));
+      pi0_.uhf[1], pi1->uhf[1], wUhfMalta * hf_asymmetry_,
+      wUhfMalta / hf_asymmetry_, norm1Uhf, &diffs, block_diff_ac, 1));
   JXL_RETURN_IF_ERROR(MaltaDiffMap(
-      pi0_.uhf[0], pi1.uhf[0], wUhfMaltaX * hf_asymmetry_,
-      wUhfMaltaX / hf_asymmetry_, norm1UhfX, &diffs, &block_diff_ac, 0));
+      pi0_.uhf[0], pi1->uhf[0], wUhfMaltaX * hf_asymmetry_,
+      wUhfMaltaX / hf_asymmetry_, norm1UhfX, &diffs, block_diff_ac, 0));
   JXL_RETURN_IF_ERROR(MaltaDiffMapLF(
-      pi0_.hf[1], pi1.hf[1], wHfMalta * std::sqrt(hf_asymmetry_),
-      wHfMalta / std::sqrt(hf_asymmetry_), norm1Hf, &diffs, &block_diff_ac, 1));
-  JXL_RETURN_IF_ERROR(MaltaDiffMapLF(pi0_.hf[0], pi1.hf[0],
+      pi0_.hf[1], pi1->hf[1], wHfMalta * std::sqrt(hf_asymmetry_),
+      wHfMalta / std::sqrt(hf_asymmetry_), norm1Hf, &diffs, block_diff_ac, 1));
+  JXL_RETURN_IF_ERROR(MaltaDiffMapLF(pi0_.hf[0], pi1->hf[0],
                                      wHfMaltaX * std::sqrt(hf_asymmetry_),
                                      wHfMaltaX / std::sqrt(hf_asymmetry_),
-                                     norm1HfX, &diffs, &block_diff_ac, 0));
-  JXL_RETURN_IF_ERROR(MaltaDiffMapLF(pi0_.mf.Plane(1), pi1.mf.Plane(1),
+                                     norm1HfX, &diffs, block_diff_ac, 0));
+  JXL_RETURN_IF_ERROR(MaltaDiffMapLF(pi0_.mf.Plane(1), pi1->mf.Plane(1),
                                      wMfMalta, wMfMalta, norm1Mf, &diffs,
-                                     &block_diff_ac, 1));
-  JXL_RETURN_IF_ERROR(MaltaDiffMapLF(pi0_.mf.Plane(0), pi1.mf.Plane(0),
+                                     block_diff_ac, 1));
+  JXL_RETURN_IF_ERROR(MaltaDiffMapLF(pi0_.mf.Plane(0), pi1->mf.Plane(0),
                                      wMfMaltaX, wMfMaltaX, norm1MfX, &diffs,
-                                     &block_diff_ac, 0));
+                                     block_diff_ac, 0));
+  // Malta computation is complete; free diffs early.
+  diffs = ImageF();
 
-  JXL_ASSIGN_OR_RETURN(Image3F block_diff_dc,
-                       Image3F::Create(memory_manager, xsize_, ysize_));
+  // Reuse pi1->lf for block_diff_dc to save 3 full planes.
+  Image3F block_diff_dc = std::move(pi1->lf);
+
   for (size_t c = 0; c < 3; ++c) {
     if (c < 2) {  // No blue channel error accumulated at HF.
       HWY_DYNAMIC_DISPATCH(L2DiffAsymmetric)
-      (pi0_.hf[c], pi1.hf[c], wmul[c] * hf_asymmetry_, wmul[c] / hf_asymmetry_,
-       &block_diff_ac.Plane(c));
+      (pi0_.hf[c], pi1->hf[c], wmul[c] * hf_asymmetry_, wmul[c] / hf_asymmetry_,
+       &block_diff_ac->Plane(c));
     }
     HWY_DYNAMIC_DISPATCH(L2Diff)
-    (pi0_.mf.Plane(c), pi1.mf.Plane(c), wmul[3 + c], &block_diff_ac.Plane(c));
+    (pi0_.mf.Plane(c), pi1->mf.Plane(c), wmul[3 + c], &block_diff_ac->Plane(c));
     HWY_DYNAMIC_DISPATCH(SetL2Diff)
-    (pi0_.lf.Plane(c), pi1.lf.Plane(c), wmul[6 + c], &block_diff_dc.Plane(c));
+    (pi0_.lf.Plane(c), block_diff_dc.Plane(c), wmul[6 + c],
+     &block_diff_dc.Plane(c));
   }
+  // Free pi1->mf early.
+  pi1->mf = Image3F();
 
   ImageF mask;
   JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(MaskPsychoImage)(
-      pi0_, pi1, xsize_, ysize_, params_, &blur_temp_, &mask,
-      &block_diff_ac.Plane(1)));
+      pi0_, *pi1, xsize_, ysize_, params_, &blur_temp_, &mask,
+      &block_diff_ac->Plane(1)));
+  // Deallocate pi1 hf and uhf now that MaskPsychoImage has used them.
+  for (int i = 0; i < 2; ++i) {
+    pi1->hf[i] = ImageF();
+    pi1->uhf[i] = ImageF();
+  }
 
-  JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(CombineChannelsToDiffmap)(
-      mask, block_diff_dc, block_diff_ac, xmul_, &diffmap));
-  return true;
+  return HWY_DYNAMIC_DISPATCH(CombineChannelsToDiffmap)(
+      mask, block_diff_dc, *block_diff_ac, xmul_, &diffmap);
 }
 
 double ButteraugliScoreFromDiffmap(const ImageF& diffmap,

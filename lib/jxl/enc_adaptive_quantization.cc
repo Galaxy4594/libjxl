@@ -1013,6 +1013,8 @@ Status FindBestQuantization(const FrameHeader& frame_header,
       JXL_RETURN_IF_ERROR(DumpHeatmaps(cparams, aux_out, butteraugli_target,
                                        quant_field, tile_distmap, diffmap));
     }
+    diffmap = ImageF();
+    dec_linear = ImageBundle(memory_manager);
     if (aux_out != nullptr) ++aux_out->num_butteraugli_iters;
     if (JXL_DEBUG_ADAPTIVE_QUANTIZATION) {
       float minval;

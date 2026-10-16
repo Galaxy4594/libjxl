@@ -1253,15 +1253,12 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
   JXL_ENSURE(tree_.size() == decoded_tree.size());
   tree_ = std::move(decoded_tree);
 
-  /* TODO(szabadka) Add text output callback to cparams
-  if (kPrintTree && WantDebugOutput(aux_out)) {
-    if (frame_header.dc_level > 0) {
-      PrintTree(tree_, aux_out->debug_prefix + "/dc_frame_level" +
-                           std::to_string(frame_header.dc_level) + "_tree");
-    } else {
-      PrintTree(tree_, aux_out->debug_prefix + "/global_tree");
-    }
-  } */
+  tree_splits_.clear();
+  tree_splits_.shrink_to_fit();
+  gi_channel_.clear();
+  gi_channel_.shrink_to_fit();
+  quants_.clear();
+  quants_.shrink_to_fit();
   return true;
 }
 
@@ -1270,13 +1267,20 @@ Status ModularFrameEncoder::ComputeTokens(ThreadPool* pool) {
   stream_headers_.resize(num_streams);
   tokens_.resize(num_streams);
   image_widths_.resize(num_streams);
+  stream_has_channels_.resize(num_streams);
+  for (size_t i = 0; i < num_streams; ++i) {
+    stream_has_channels_[i] = !stream_images_[i].channel.empty();
+  }
   const auto process_stream = [&](const uint32_t stream_id,
                                   size_t /* thread */) -> Status {
+    if (!stream_has_channels_[stream_id]) return true;
     tokens_[stream_id].clear();
     JXL_RETURN_IF_ERROR(
         ModularCompress(stream_images_[stream_id], stream_options_[stream_id],
                         stream_id, tree_, stream_headers_[stream_id],
                         tokens_[stream_id], &image_widths_[stream_id]));
+    Image empty_image(stream_images_[stream_id].memory_manager());
+    std::swap(stream_images_[stream_id], empty_image);
     return true;
   };
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_streams, ThreadPool::NoInit,
@@ -1314,6 +1318,8 @@ Status ModularFrameEncoder::EncodeGlobalInfo(bool streaming_mode,
     (void)cost;
     JXL_RETURN_IF_ERROR(WriteTokens(tree_tokens_[0], tree_code, 0, writer,
                                     LayerType::ModularTree, aux_out));
+    tree_tokens_.clear();
+    tree_tokens_.shrink_to_fit();
   }
   params.streaming_mode = streaming_mode;
   params.add_missing_symbols = streaming_mode;
@@ -1324,6 +1330,12 @@ Status ModularFrameEncoder::EncodeGlobalInfo(bool streaming_mode,
                        memory_manager, params, (tree_.size() + 1) / 2, tokens_,
                        &code_, writer, LayerType::ModularGlobal, aux_out));
   (void)cost;
+  tree_.clear();
+  tree_.shrink_to_fit();
+  image_widths_.clear();
+  image_widths_.shrink_to_fit();
+  stream_options_.clear();
+  stream_options_.shrink_to_fit();
   return true;
 }
 
@@ -1331,20 +1343,30 @@ Status ModularFrameEncoder::EncodeStream(BitWriter* writer, AuxOut* aux_out,
                                          LayerType layer,
                                          const ModularStreamId& stream) {
   size_t stream_id = stream.ID(frame_dim_);
-  if (stream_images_[stream_id].channel.empty()) {
-    JXL_DEBUG_V(10, "Modular stream %" PRIuS " is empty.", stream_id);
-    return true;  // Image with no channels, header never gets decoded.
-  }
-  if (tokens_.empty()) {
-    JXL_RETURN_IF_ERROR(ModularGenericCompress(
-        stream_images_[stream_id], stream_options_[stream_id], *writer, aux_out,
-        layer, stream_id));
-  } else {
+  if (!tokens_.empty()) {
+    if (stream_id >= stream_has_channels_.size() ||
+        !stream_has_channels_[stream_id]) {
+      JXL_DEBUG_V(10, "Modular stream %" PRIuS " is empty.", stream_id);
+      return true;  // Image with no channels, header never gets decoded.
+    }
     JXL_RETURN_IF_ERROR(
         Bundle::Write(stream_headers_[stream_id], writer, layer, aux_out));
     JXL_RETURN_IF_ERROR(
         WriteTokens(tokens_[stream_id], code_, 0, writer, layer, aux_out));
+    tokens_[stream_id].clear();
+    tokens_[stream_id].shrink_to_fit();
+    return true;
   }
+  if (stream_id >= stream_images_.size() ||
+      stream_images_[stream_id].channel.empty()) {
+    JXL_DEBUG_V(10, "Modular stream %" PRIuS " is empty.", stream_id);
+    return true;  // Image with no channels, header never gets decoded.
+  }
+  JXL_RETURN_IF_ERROR(ModularGenericCompress(
+      stream_images_[stream_id], stream_options_[stream_id], *writer, aux_out,
+      layer, stream_id));
+  Image empty_image(stream_images_[stream_id].memory_manager());
+  std::swap(stream_images_[stream_id], empty_image);
   return true;
 }
 
