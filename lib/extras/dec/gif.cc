@@ -222,8 +222,11 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
                           image.ImageDesc.Width, image.ImageDesc.Height);
 
     Rect total_rect;
-    if (previous_rect_if_restore_to_background.xsize() != 0 ||
-        previous_rect_if_restore_to_background.ysize() != 0) {
+    if (i == 0) {
+      total_rect = canvas_rect;
+      replace = true;
+    } else if (previous_rect_if_restore_to_background.xsize() != 0 ||
+               previous_rect_if_restore_to_background.ysize() != 0) {
       const size_t xbegin = std::min(
           image_rect.x0(), previous_rect_if_restore_to_background.x0());
       const size_t ybegin = std::min(
@@ -281,6 +284,13 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
     GraphicsControlBlock gcb;
     DGifSavedExtensionToGCB(gif.get(), i, &gcb);
     msan::UnpoisonMemory(&gcb, sizeof(gcb));
+
+    // Some encoders (and apparently some specs) represent
+    // DisposalMethod::RESTORE_PREVIOUS as 4, but 3 is used in the canonical
+    // spec and is more popular, so we normalize to 3.
+    if (gcb.DisposalMode == 4) {
+      gcb.DisposalMode = DISPOSE_PREVIOUS;
+    }
     bool is_full_size = total_rect.x0() == 0 && total_rect.y0() == 0 &&
                         total_rect.xsize() == canvas.color.xsize &&
                         total_rect.ysize() == canvas.color.ysize;
@@ -316,17 +326,15 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
             "for non-full or blended frames");
       }
       switch (gcb.DisposalMode) {
-        case DISPOSE_DO_NOT:
-        case DISPOSE_BACKGROUND:
-          frame->frame_info.layer_info.save_as_reference = 1u;
-          last_base_was_none = false;
-          break;
         case DISPOSE_PREVIOUS:
           frame->frame_info.layer_info.save_as_reference = 0u;
           break;
+        case DISPOSAL_UNSPECIFIED:
+        case DISPOSE_DO_NOT:
+        case DISPOSE_BACKGROUND:
         default:
-          frame->frame_info.layer_info.save_as_reference = 0u;
-          last_base_was_none = true;
+          frame->frame_info.layer_info.save_as_reference = 1u;
+          last_base_was_none = false;
       }
     }
 
@@ -345,11 +353,10 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
                         image_rect.x0();
       for (size_t x = 0; x < image_rect.xsize(); ++x, ++byte_index) {
         const GifByteType byte = image.RasterBits[byte_index];
+        if (byte == gcb.TransparentColor) continue;
         if (byte >= color_map->ColorCount) {
           return JXL_FAILURE("GIF color is out of bounds");
         }
-
-        if (byte == gcb.TransparentColor) continue;
         GifColorType color = color_map->Colors[byte];
         row[x].r = color.Red;
         row[x].g = color.Green;
@@ -380,15 +387,15 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
                          y * sub_frame_image.xsize;
         for (size_t x = 0; x < image_rect.xsize(); ++x, ++byte_index) {
           const GifByteType byte = image.RasterBits[byte_index];
-          if (byte >= color_map->ColorCount) {
-            return JXL_FAILURE("GIF color is out of bounds");
-          }
           if (byte == gcb.TransparentColor) {
             row[x].r = 0;
             row[x].g = 0;
             row[x].b = 0;
             JXL_RETURN_IF_ERROR(set_pixel_alpha(x, y, 0));
             continue;
+          }
+          if (byte >= color_map->ColorCount) {
+            return JXL_FAILURE("GIF color is out of bounds");
           }
           GifColorType color = color_map->Colors[byte];
           row[x].r = color.Red;
@@ -404,10 +411,6 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
     }
 
     switch (gcb.DisposalMode) {
-      case DISPOSE_DO_NOT:
-        canvas.color = std::move(new_canvas_image);
-        break;
-
       case DISPOSE_BACKGROUND:
         std::fill_n(static_cast<PackedRgba*>(canvas.color.pixels()),
                     canvas.color.xsize * canvas.color.ysize, background_rgba);
@@ -418,9 +421,9 @@ Status DecodeImageGIF(Span<const uint8_t> bytes, const ColorHints& color_hints,
         break;
 
       case DISPOSAL_UNSPECIFIED:
+      case DISPOSE_DO_NOT:
       default:
-        std::fill_n(static_cast<PackedRgba*>(canvas.color.pixels()),
-                    canvas.color.xsize * canvas.color.ysize, background_rgba);
+        canvas.color = std::move(new_canvas_image);
     }
   }
   // Finally, if any frame has an alpha-channel, every frame will need
