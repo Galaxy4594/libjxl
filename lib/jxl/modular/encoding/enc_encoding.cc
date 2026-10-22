@@ -177,20 +177,29 @@ Status GatherTreeData(const Image &image, pixel_type chan, size_t group_id,
         compute_sample(p, x, y);
       }
       for (size_t x = 2; x < channel.w - 2; x++) {
-        pixel_type_w pred[kNumModularPredictors];
-        if (multiple_predictors) {
-          PredictLearnAllNEC(&properties, channel.w, p + x, onerow, x, y,
-                             references, &wp_state, pred);
-        } else {
-          pred[static_cast<int>(tree_samples.PredictorFromIndex(0))] =
-              PredictLearnNEC(&properties, channel.w, p + x, onerow, x, y,
-                              tree_samples.PredictorFromIndex(0), references,
-                              &wp_state)
-                  .guess;
-        }
         (*total_pixels)++;
         if (use_sample()) {
+          pixel_type_w pred[kNumModularPredictors];
+          if (multiple_predictors) {
+            PredictLearnAllNEC(&properties, channel.w, p + x, onerow, x, y,
+                               references, &wp_state, pred);
+          } else {
+            pred[static_cast<int>(tree_samples.PredictorFromIndex(0))] =
+                PredictLearnNEC(&properties, channel.w, p + x, onerow, x, y,
+                                tree_samples.PredictorFromIndex(0), references,
+                                &wp_state)
+                    .guess;
+          }
           tree_samples.AddSample(p[x], properties, pred);
+        } else {
+          pixel_type_w left = p[x - 1];
+          pixel_type_w top = p[x - onerow];
+          pixel_type_w topleft = p[x - 1 - onerow];
+          pixel_type_w topright = p[x + 1 - onerow];
+          pixel_type_w toptop = p[x - onerow - onerow];
+          wp_state.Predict</*compute_properties=*/false>(
+              x, y, channel.w, top, left, topright, topleft, toptop, nullptr,
+              0);
         }
         wp_state.UpdateErrors(p[x], x, y, channel.w);
       }

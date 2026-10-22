@@ -211,9 +211,45 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
     JXL_DASSERT(begin <= end);
     JXL_DASSERT(end <= tree_samples.NumDistinctSamples());
 
-    // Compute the maximum token in the range.
+    // Early Predictor Pruning: if evaluating multiple predictors (e.g., -P 15),
+    // evaluate the L1 residual error on the first 5% of samples for this branch.
+    // Predictors that perform substantially worse are pruned before full histogram evaluation.
+    std::vector<bool> pred_active(num_predictors, true);
+    size_t cur_pred_idx = tree_samples.PredictorIndex((*tree)[pos].predictor);
+    if (num_predictors > 2 && (end - begin) >= 64) {
+      size_t check_count = std::max<size_t>(32, (end - begin) / 20);
+      check_count = std::min(check_count, end - begin);
+      std::vector<uint64_t> sample_l1(num_predictors, 0);
+      for (size_t pred = 0; pred < num_predictors; pred++) {
+        const std::vector<ResidualToken>& rtokens = tree_samples.RTokens(pred);
+        uint64_t l1 = 0;
+        for (size_t i = begin; i < begin + check_count; i++) {
+          const ResidualToken& rt = rtokens[i];
+          uint64_t approx_mag = (static_cast<uint64_t>(rt.tok) << 2) + rt.nbits;
+          l1 += approx_mag * tree_samples.Count(i);
+        }
+        sample_l1[pred] = l1;
+      }
+      uint64_t min_l1 = *std::min_element(sample_l1.begin(), sample_l1.end());
+      std::vector<uint64_t> sorted_l1 = sample_l1;
+      std::sort(sorted_l1.begin(), sorted_l1.end());
+      // Guarantee keeping at least the top 4 predictors
+      uint64_t rank4_l1 = sorted_l1.size() > 4 ? sorted_l1[3] : sorted_l1.back();
+      uint64_t threshold_l1 = static_cast<uint64_t>(min_l1 * 1.4f);
+      uint64_t cutoff = std::max(threshold_l1, rank4_l1);
+
+      for (size_t pred = 0; pred < num_predictors; pred++) {
+        if (pred == cur_pred_idx) continue;
+        if (sample_l1[pred] > cutoff) {
+          pred_active[pred] = false;
+        }
+      }
+    }
+
+    // Compute the maximum token in the range for active predictors.
     size_t max_symbols = 0;
     for (size_t pred = 0; pred < num_predictors; pred++) {
+      if (!pred_active[pred] && pred != cur_pred_idx) continue;
       for (size_t i = begin; i < end; i++) {
         uint32_t tok = tree_samples.Token(pred, i);
         max_symbols = max_symbols > tok + 1 ? max_symbols : tok + 1;
@@ -223,6 +259,7 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
     std::vector<int32_t> counts(max_symbols * num_predictors);
     std::vector<uint32_t> tot_extra_bits(num_predictors);
     for (size_t pred = 0; pred < num_predictors; pred++) {
+      if (!pred_active[pred] && pred != cur_pred_idx) continue;
       size_t extra_bits = 0;
       const std::vector<ResidualToken>& rtokens = tree_samples.RTokens(pred);
       for (size_t i = begin; i < end; i++) {
@@ -237,7 +274,7 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
 
     float base_bits;
     {
-      size_t pred = tree_samples.PredictorIndex((*tree)[pos].predictor);
+      size_t pred = cur_pred_idx;
       base_bits =
           EstimateBits(counts.data() + pred * max_symbols, max_symbols) +
           tot_extra_bits[pred];
@@ -345,8 +382,9 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
         }
         costs_l.resize(last_used - first_used);
         costs_r.resize(last_used - first_used);
-        // For all predictors, compute the right and left costs of each split.
+        // For active predictors, compute the right and left costs of each split.
         for (size_t pred = 0; pred < num_predictors; pred++) {
+          if (!pred_active[pred]) continue;
           // Compute cost and histogram increments for each property value.
           const std::vector<ResidualToken> &rtokens =
               tree_samples.RTokens(pred);
@@ -371,10 +409,13 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
             // The increase for this property value has been used, and will not
             // be used again: clear it. Also below.
             extra_bits_increase[i] = 0;
-            for (size_t sym = 0; sym < max_symbols; sym++) {
-              counts_above[sym] -= count_increase[i * max_symbols + sym];
-              counts_below[sym] += count_increase[i * max_symbols + sym];
-              count_increase[i * max_symbols + sym] = 0;
+            for (size_t sym = 0; sym < max_symbols; sym += Lanes(di)) {
+              auto inc = LoadU(di, &count_increase[i * max_symbols + sym]);
+              auto ca = LoadU(di, &counts_above[sym]);
+              auto cb = LoadU(di, &counts_below[sym]);
+              StoreU(Sub(ca, inc), di, &counts_above[sym]);
+              StoreU(Add(cb, inc), di, &counts_below[sym]);
+              StoreU(Zero(di), di, &count_increase[i * max_symbols + sym]);
             }
             float rcost = EstimateBits(counts_above.data(), max_symbols) +
                           tot_extra_bits[pred] - extra_bits_below;
@@ -442,8 +483,8 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
         }
         // Clear extra_bits_increase and cost_increase for last_used.
         extra_bits_increase[last_used] = 0;
-        for (size_t sym = 0; sym < max_symbols; sym++) {
-          count_increase[last_used * max_symbols + sym] = 0;
+        for (size_t sym = 0; sym < max_symbols; sym += Lanes(di)) {
+          StoreU(Zero(di), di, &count_increase[last_used * max_symbols + sym]);
         }
       }
 
