@@ -596,7 +596,8 @@ Status TreeSamples::SetPredictor(Predictor predictor,
     std::swap(predictors[0], predictors[static_cast<int>(Predictor::Weighted)]);
     std::swap(predictors[1], predictors[static_cast<int>(Predictor::Gradient)]);
   } else if (predictor == Predictor::Best) {
-    predictors = {Predictor::Weighted, Predictor::Gradient};
+    predictors = {Predictor::Weighted, Predictor::Gradient, Predictor::Select,
+                  Predictor::Zero, Predictor::Left, Predictor::Top};
   } else {
     predictors = {predictor};
   }

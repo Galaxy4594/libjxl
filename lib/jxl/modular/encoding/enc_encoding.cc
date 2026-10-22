@@ -333,13 +333,120 @@ Status EncodeModularChannelMAANS(const Image &image, pixel_type chan,
     bool unhealthy = false;
     for (size_t y = 0; y < channel.h; y++) {
       const pixel_type *JXL_RESTRICT r = channel.Row(y);
-      for (size_t x = 0; x < channel.w; x++) {
-        pixel_type_w left = (x ? r[x - 1] : y ? *(r + x - onerow) : 0);
-        pixel_type_w top = (y ? *(r + x - onerow) : left);
-        pixel_type_w topleft = (x && y ? *(r + x - 1 - onerow) : left);
-        int32_t guess = ClampedGradient(top, left, topleft);
+      if (y == 0) {
+        int32_t first_res;
+        unhealthy |= SubOverflow(r[0], static_cast<pixel_type_w>(0), first_res);
+        *tokenp++ = Token(tree[0].childID, PackSigned(first_res));
+        for (size_t x = 1; x < channel.w; x++) {
+          int32_t residual;
+          unhealthy |= SubOverflow(r[x], static_cast<pixel_type_w>(r[x - 1]), residual);
+          *tokenp++ = Token(tree[0].childID, PackSigned(residual));
+        }
+      } else {
+        const pixel_type *JXL_RESTRICT top_r = r - onerow;
+        int32_t first_res;
+        unhealthy |= SubOverflow(r[0], static_cast<pixel_type_w>(top_r[0]), first_res);
+        *tokenp++ = Token(tree[0].childID, PackSigned(first_res));
+        for (size_t x = 1; x < channel.w; x++) {
+          int32_t guess = ClampedGradient(top_r[x], r[x - 1], top_r[x - 1]);
+          int32_t residual;
+          unhealthy |= SubOverflow(r[x], guess, residual);
+          *tokenp++ = Token(tree[0].childID, PackSigned(residual));
+        }
+      }
+    }
+    if (unhealthy) {
+      return JXL_FAILURE("Residual overflow");
+    }
+  } else if (tree.size() == 1 && tree[0].predictor == Predictor::Top &&
+             tree[0].multiplier == 1 && tree[0].predictor_offset == 0 &&
+             !skip_encoder_fast_path) {
+    for (size_t c = 0; c < 3; c++) {
+      FillImage(static_cast<float>(PredictorColor(Predictor::Top)[c]),
+                &predictor_img.Plane(c));
+    }
+    const ptrdiff_t onerow = channel.plane.PixelsPerRow();
+    bool unhealthy = false;
+    for (size_t y = 0; y < channel.h; y++) {
+      const pixel_type *JXL_RESTRICT r = channel.Row(y);
+      if (y == 0) {
+        int32_t first_res;
+        unhealthy |= SubOverflow(r[0], static_cast<pixel_type_w>(0), first_res);
+        *tokenp++ = Token(tree[0].childID, PackSigned(first_res));
+        for (size_t x = 1; x < channel.w; x++) {
+          int32_t residual;
+          unhealthy |= SubOverflow(r[x], static_cast<pixel_type_w>(r[x - 1]), residual);
+          *tokenp++ = Token(tree[0].childID, PackSigned(residual));
+        }
+      } else {
+        const pixel_type *JXL_RESTRICT top_r = r - onerow;
+        for (size_t x = 0; x < channel.w; x++) {
+          int32_t residual;
+          unhealthy |= SubOverflow(r[x], static_cast<pixel_type_w>(top_r[x]), residual);
+          *tokenp++ = Token(tree[0].childID, PackSigned(residual));
+        }
+      }
+    }
+    if (unhealthy) {
+      return JXL_FAILURE("Residual overflow");
+    }
+  } else if (tree.size() == 1 && tree[0].predictor == Predictor::Select &&
+             tree[0].multiplier == 1 && tree[0].predictor_offset == 0 &&
+             !skip_encoder_fast_path) {
+    for (size_t c = 0; c < 3; c++) {
+      FillImage(static_cast<float>(PredictorColor(Predictor::Select)[c]),
+                &predictor_img.Plane(c));
+    }
+    const ptrdiff_t onerow = channel.plane.PixelsPerRow();
+    bool unhealthy = false;
+    for (size_t y = 0; y < channel.h; y++) {
+      const pixel_type *JXL_RESTRICT r = channel.Row(y);
+      if (y == 0) {
+        int32_t first_res;
+        unhealthy |= SubOverflow(r[0], static_cast<pixel_type_w>(0), first_res);
+        *tokenp++ = Token(tree[0].childID, PackSigned(first_res));
+        for (size_t x = 1; x < channel.w; x++) {
+          int32_t residual;
+          unhealthy |= SubOverflow(r[x], static_cast<pixel_type_w>(r[x - 1]), residual);
+          *tokenp++ = Token(tree[0].childID, PackSigned(residual));
+        }
+      } else {
+        const pixel_type *JXL_RESTRICT top_r = r - onerow;
+        int32_t first_res;
+        unhealthy |= SubOverflow(r[0], static_cast<pixel_type_w>(top_r[0]), first_res);
+        *tokenp++ = Token(tree[0].childID, PackSigned(first_res));
+        for (size_t x = 1; x < channel.w; x++) {
+          pixel_type_w W = r[x - 1];
+          pixel_type_w N = top_r[x];
+          pixel_type_w NW = top_r[x - 1];
+          pixel_type_w guess = Select(W, N, NW);
+          int32_t residual;
+          unhealthy |= SubOverflow(r[x], guess, residual);
+          *tokenp++ = Token(tree[0].childID, PackSigned(residual));
+        }
+      }
+    }
+    if (unhealthy) {
+      return JXL_FAILURE("Residual overflow");
+    }
+  } else if (tree.size() == 1 && tree[0].predictor == Predictor::Left &&
+             tree[0].multiplier == 1 && tree[0].predictor_offset == 0 &&
+             !skip_encoder_fast_path) {
+    for (size_t c = 0; c < 3; c++) {
+      FillImage(static_cast<float>(PredictorColor(Predictor::Left)[c]),
+                &predictor_img.Plane(c));
+    }
+    const ptrdiff_t onerow = channel.plane.PixelsPerRow();
+    bool unhealthy = false;
+    for (size_t y = 0; y < channel.h; y++) {
+      const pixel_type *JXL_RESTRICT r = channel.Row(y);
+      pixel_type_w first_guess = (y ? *(r - onerow) : 0);
+      int32_t first_res;
+      unhealthy |= SubOverflow(r[0], first_guess, first_res);
+      *tokenp++ = Token(tree[0].childID, PackSigned(first_res));
+      for (size_t x = 1; x < channel.w; x++) {
         int32_t residual;
-        unhealthy |= SubOverflow(r[x], guess, residual);
+        unhealthy |= SubOverflow(r[x], static_cast<pixel_type_w>(r[x - 1]), residual);
         *tokenp++ = Token(tree[0].childID, PackSigned(residual));
       }
     }
@@ -386,30 +493,6 @@ Status EncodeModularChannelMAANS(const Image &image, pixel_type chan,
       for (size_t x = 0; x < channel.w; x++) {
         *tokenp++ = Token(tree[0].childID, PackSigned(p[x]));
       }
-    }
-  } else if (tree.size() == 1 && tree[0].predictor == Predictor::Left &&
-             tree[0].multiplier == 1 && tree[0].predictor_offset == 0 &&
-             !skip_encoder_fast_path) {
-    for (size_t c = 0; c < 3; c++) {
-      FillImage(static_cast<float>(PredictorColor(Predictor::Left)[c]),
-                &predictor_img.Plane(c));
-    }
-    const ptrdiff_t onerow = channel.plane.PixelsPerRow();
-    bool unhealthy = false;
-    for (size_t y = 0; y < channel.h; y++) {
-      const pixel_type *JXL_RESTRICT r = channel.Row(y);
-      pixel_type_w first_guess = (y ? *(r - onerow) : 0);
-      int32_t first_res;
-      unhealthy |= SubOverflow(r[0], first_guess, first_res);
-      *tokenp++ = Token(tree[0].childID, PackSigned(first_res));
-      for (size_t x = 1; x < channel.w; x++) {
-        int32_t residual;
-        unhealthy |= SubOverflow(r[x], static_cast<pixel_type_w>(r[x - 1]), residual);
-        *tokenp++ = Token(tree[0].childID, PackSigned(residual));
-      }
-    }
-    if (unhealthy) {
-      return JXL_FAILURE("Residual overflow");
     }
   } else if (tree.size() == 1 && tree[0].predictor != Predictor::Weighted &&
              (tree[0].multiplier & (tree[0].multiplier - 1)) == 0 &&
