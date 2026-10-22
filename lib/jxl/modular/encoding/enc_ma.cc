@@ -190,7 +190,7 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
 
     StaticPropRange static_prop_range = nodes.back().static_prop_range;
     nodes.pop_back();
-    if (begin == end) continue;
+    if (end - begin < 8) continue;
 
     struct SplitInfo {
       size_t prop = 0;
@@ -345,7 +345,7 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
 
       // The lower the threshold, the higher the expected noisiness of the
       // estimate. Thus, discourage changing predictors.
-      float change_pred_penalty = 800.0f / (100.0f + threshold);
+      float change_pred_penalty = 2000.0f / (100.0f + threshold);
       for (size_t prop = 0; prop < num_properties && base_bits > threshold;
            prop++) {
         costs_l.clear();

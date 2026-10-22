@@ -387,6 +387,30 @@ Status EncodeModularChannelMAANS(const Image &image, pixel_type chan,
         *tokenp++ = Token(tree[0].childID, PackSigned(p[x]));
       }
     }
+  } else if (tree.size() == 1 && tree[0].predictor == Predictor::Left &&
+             tree[0].multiplier == 1 && tree[0].predictor_offset == 0 &&
+             !skip_encoder_fast_path) {
+    for (size_t c = 0; c < 3; c++) {
+      FillImage(static_cast<float>(PredictorColor(Predictor::Left)[c]),
+                &predictor_img.Plane(c));
+    }
+    const ptrdiff_t onerow = channel.plane.PixelsPerRow();
+    bool unhealthy = false;
+    for (size_t y = 0; y < channel.h; y++) {
+      const pixel_type *JXL_RESTRICT r = channel.Row(y);
+      pixel_type_w first_guess = (y ? *(r - onerow) : 0);
+      int32_t first_res;
+      unhealthy |= SubOverflow(r[0], first_guess, first_res);
+      *tokenp++ = Token(tree[0].childID, PackSigned(first_res));
+      for (size_t x = 1; x < channel.w; x++) {
+        int32_t residual;
+        unhealthy |= SubOverflow(r[x], static_cast<pixel_type_w>(r[x - 1]), residual);
+        *tokenp++ = Token(tree[0].childID, PackSigned(residual));
+      }
+    }
+    if (unhealthy) {
+      return JXL_FAILURE("Residual overflow");
+    }
   } else if (tree.size() == 1 && tree[0].predictor != Predictor::Weighted &&
              (tree[0].multiplier & (tree[0].multiplier - 1)) == 0 &&
              tree[0].predictor_offset == 0 && !skip_encoder_fast_path) {
