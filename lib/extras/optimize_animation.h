@@ -12,13 +12,8 @@
 namespace jxl {
 namespace extras {
 
-// Performs delta optimization, temporal deduplication, and timebase
-// normalization on animated frames in `ppf`. This includes:
-// 1. Consecutive identical frame deduplication (folding durations).
-// 2. Loop-boundary frame deduplication (last frame == first frame).
-// 3. Timebase and frame duration GCD reduction (minimizing header varints).
-// 4. Dirty transparent pixel clearing (optim_dirty).
-// 5. Minimal bounding-box cropping with delta reference blending.
+// Deduplicates identical frames, simplifies frame duration ticks, and crops
+// frames to bounding-box deltas with reference blending where beneficial.
 Status OptimizeAnimation(PackedPixelFile* ppf);
 
 }  // namespace extras

@@ -1190,18 +1190,10 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
     ppf->info.intensity_target = 0.f;
   }
 
-  // Check whether the APNG contains complex disposals (BACKGROUND or PREVIOUS)
-  // or 1x1 dummy delay frames (used by some tools for variable frame rate timing).
-  //
-  // Unoptimized animations or animations with complex disposals require canvas
-  // compositing so that consecutive identical canvas frames (such as dummy delay
-  // frames) can be deduplicated, disposal states resolved, and optimal bounding
-  // boxes/deltas computed by OptimizeAnimation().
-  //
-  // Pure overlay animations (all frames have DisposeOp::NONE, without dummy frames),
-  // such as demo.png, already represent compact overlay deltas with transparency.
-  // Preserving native overlay frames and blend modes allows modular palette
-  // encoding and avoids bloating into full-canvas high-entropy RGB frames.
+  // Composite onto a full canvas when the animation uses BACKGROUND/PREVIOUS
+  // disposal or 1x1 dummy delay frames, so that OptimizeAnimation can resolve
+  // disposals, fold duplicate frames, and compute minimal delta regions.
+  // Pure DisposeOp::NONE overlay animations preserve their native subframes.
   bool has_complex_disposal = false;
   bool has_dummy_frames = false;
   for (const auto& frame : frames) {
@@ -1221,8 +1213,8 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
     const size_t pixel_stride =
         PackedImage::BitsPerChannel(canvas_format.data_type) / 8 *
         canvas_format.num_channels;
-    const bool has_alpha = canvas_format.num_channels == 2 ||
-                           canvas_format.num_channels == 4;
+    const bool has_alpha =
+        canvas_format.num_channels == 2 || canvas_format.num_channels == 4;
     const size_t alpha_idx = canvas_format.num_channels - 1;
 
     JXL_ASSIGN_OR_RETURN(
@@ -1250,11 +1242,11 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
 
       if (fc.blend_op == BlendOp::SOURCE || !has_alpha) {
         for (size_t y = 0; y < ysize; ++y) {
-          memcpy(static_cast<uint8_t*>(canvas.pixels()) +
-                     (y0 + y) * canvas.stride + x0 * pixel_stride,
-                 static_cast<const uint8_t*>(pixels.pixels()) +
-                     y * pixels.stride,
-                 xsize * pixel_stride);
+          memcpy(
+              static_cast<uint8_t*>(canvas.pixels()) +
+                  (y0 + y) * canvas.stride + x0 * pixel_stride,
+              static_cast<const uint8_t*>(pixels.pixels()) + y * pixels.stride,
+              xsize * pixel_stride);
         }
       } else {
         if (canvas_format.data_type == JXL_TYPE_UINT8) {
@@ -1380,11 +1372,12 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
                 PackedImage::BitsPerChannel(new_data.format.data_type) / 8;
             size_t pixel_stride =
                 bytes_per_sample * new_data.format.num_channels;
-            memcpy(
-                static_cast<uint8_t*>(new_data.pixels()) +
-                    new_data.stride * (y + y0 - py0) + pixel_stride * (x0 - px0),
-                static_cast<const uint8_t*>(pixels.pixels()) + pixels.stride * y,
-                xsize * pixel_stride);
+            memcpy(static_cast<uint8_t*>(new_data.pixels()) +
+                       new_data.stride * (y + y0 - py0) +
+                       pixel_stride * (x0 - px0),
+                   static_cast<const uint8_t*>(pixels.pixels()) +
+                       pixels.stride * y,
+                   xsize * pixel_stride);
           }
 
           x0 = px0;

@@ -247,6 +247,4 @@ class PackedPixelFile {
 }  // namespace extras
 }  // namespace jxl
 
-#include "lib/extras/optimize_animation.h"
-
 #endif  // LIB_EXTRAS_PACKED_IMAGE_H_

@@ -33,6 +33,7 @@
 #include "lib/extras/dec/decode.h"
 #include "lib/extras/dec/pnm.h"
 #include "lib/extras/enc/jxl.h"
+#include "lib/extras/optimize_animation.h"
 #include "lib/extras/packed_image.h"
 #include "lib/extras/time.h"
 #include "lib/jxl/base/c_callback_support.h"
