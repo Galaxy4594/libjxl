@@ -520,6 +520,67 @@ Status OptimizeAnimation(PackedPixelFile* ppf) {
     }
 
     if (bounding_box_is_large && !can_use_blend) {
+      if (curr_frame.frame_info.layer_info.blend_info.blendmode ==
+          JXL_BLEND_BLEND) {
+        // This frame was already a blended overlay in the input container!
+        // Untouched pixels have alpha == 0. Forcing JXL_BLEND_REPLACE would replace
+        // the canvas with this raw overlay, creating transparent/black holes.
+        // Instead, keep JXL_BLEND_BLEND and composite curr_frame over canvas so that
+        // subsequent frames compare against the true rendered state.
+        curr_frame.frame_info.layer_info.have_crop = 0;
+        curr_frame.frame_info.layer_info.crop_x0 = 0;
+        curr_frame.frame_info.layer_info.crop_y0 = 0;
+        curr_frame.frame_info.layer_info.xsize = W;
+        curr_frame.frame_info.layer_info.ysize = H;
+        curr_frame.frame_info.layer_info.blend_info.blendmode = JXL_BLEND_BLEND;
+        curr_frame.frame_info.layer_info.blend_info.source = 1;
+        curr_frame.frame_info.layer_info.blend_info.alpha = 0;
+        curr_frame.frame_info.layer_info.blend_info.clamp = 1;
+        curr_frame.frame_info.layer_info.save_as_reference = 1;
+
+        const size_t alpha_channel_offset =
+            ppf->info.num_color_channels * bytes_per_sample;
+
+        for (size_t y = 0; y < H; ++y) {
+          uint8_t* c_color_row =
+              static_cast<uint8_t*>(canvas.color.pixels()) +
+              y * canvas.color.stride;
+          const uint8_t* f_color_row =
+              static_cast<const uint8_t*>(curr_frame.color.pixels()) +
+              y * curr_frame.color.stride;
+          uint8_t* c_alpha_row =
+              has_extra_channel_alpha
+                  ? (static_cast<uint8_t*>(canvas.extra_channels[0].pixels()) +
+                     y * canvas.extra_channels[0].stride)
+                  : nullptr;
+          const uint8_t* f_alpha_row =
+              has_extra_channel_alpha
+                  ? (static_cast<const uint8_t*>(
+                         curr_frame.extra_channels[0].pixels()) +
+                     y * curr_frame.extra_channels[0].stride)
+                  : nullptr;
+
+          for (size_t x = 0; x < W; ++x) {
+            uint8_t a = 255;
+            if (has_extra_channel_alpha) {
+              a = f_alpha_row[x * alpha_pixel_stride];
+            } else if (has_interleaved_alpha) {
+              a = f_color_row[x * color_pixel_stride + alpha_channel_offset];
+            }
+            if (a > 0) {
+              memcpy(c_color_row + x * color_pixel_stride,
+                     f_color_row + x * color_pixel_stride, color_pixel_stride);
+              if (has_extra_channel_alpha) {
+                memcpy(c_alpha_row + x * alpha_pixel_stride,
+                       f_alpha_row + x * alpha_pixel_stride,
+                       alpha_pixel_stride);
+              }
+            }
+          }
+        }
+        continue;
+      }
+
       curr_frame.frame_info.layer_info.have_crop = 0;
       curr_frame.frame_info.layer_info.crop_x0 = 0;
       curr_frame.frame_info.layer_info.crop_y0 = 0;
