@@ -175,6 +175,26 @@ int64_t ComputeOLACost(const std::vector<size_t>& remapping,
   return total;
 }
 
+struct WeightedEdge {
+  size_t to;
+  int64_t weight;
+};
+
+using AdjList = std::vector<std::vector<WeightedEdge>>;
+
+AdjList BuildAdjList(const std::vector<std::vector<uint32_t>>& matrix) {
+  size_t n = matrix.size();
+  AdjList adj(n);
+  for (size_t i = 0; i < n; ++i) {
+    for (size_t j = 0; j < n; ++j) {
+      if (i != j && matrix[i][j] > 0) {
+        adj[i].push_back({j, static_cast<int64_t>(matrix[i][j])});
+      }
+    }
+  }
+  return adj;
+}
+
 std::vector<size_t> EZengReindexWithSeed(
     const std::vector<std::vector<uint32_t>>& matrix, size_t seed_u,
     size_t seed_v) {
@@ -206,15 +226,17 @@ std::vector<size_t> EZengReindexWithSeed(
     size_t best_pos = 0;
     int64_t best_cost = std::numeric_limits<int64_t>::max();
     int64_t cross_cost = 0;
+    int64_t new_cost = 0;
+    int64_t left_w = 0;
+    int64_t right_w = 0;
+    const auto& best_row = matrix[best_index];
+    for (size_t k = 0; k < m; k++) {
+      int64_t w = best_row[remapping[k]];
+      new_cost += w * static_cast<int64_t>(k + 1);
+      right_w += w;
+    }
 
     for (size_t p = 0; p <= m; p++) {
-      int64_t new_cost = 0;
-      for (size_t k = 0; k < m; k++) {
-        size_t dist = (k < p) ? (p - k) : (k + 1 - p);
-        new_cost +=
-            static_cast<int64_t>(matrix[best_index][remapping[k]]) * dist;
-      }
-
       int64_t total = new_cost + cross_cost;
       if (total < best_cost) {
         best_cost = total;
@@ -223,11 +245,16 @@ std::vector<size_t> EZengReindexWithSeed(
 
       if (p < m) {
         size_t rp = remapping[p];
+        int64_t w_rp = best_row[rp];
+        right_w -= w_rp;
+        new_cost += left_w - right_w;
+        left_w += w_rp;
+        const auto& rp_row = matrix[rp];
         for (size_t b = p + 1; b < m; b++) {
-          cross_cost += matrix[rp][remapping[b]];
+          cross_cost += rp_row[remapping[b]];
         }
         for (size_t a = 0; a < p; a++) {
-          cross_cost -= matrix[remapping[a]][rp];
+          cross_cost -= rp_row[remapping[a]];
         }
       }
     }
@@ -240,7 +267,7 @@ std::vector<size_t> EZengReindexWithSeed(
       best_sum_pos = 0;
       best_sum_val = 0;
       for (size_t i = 0; i < sums.size(); i++) {
-        sums[i].second += matrix[best_index][sums[i].first];
+        sums[i].second += best_row[sums[i].first];
         if (sums[i].second >= best_sum_val) {
           best_sum_pos = i;
           best_sum_val = sums[i].second;
@@ -276,12 +303,16 @@ std::vector<size_t> EZengReindex(
   return EZengReindexWithSeed(matrix, best_u, best_v);
 }
 
-void PairwiseSwapSearch(std::vector<size_t>& remapping,
-                        const std::vector<std::vector<uint32_t>>& matrix,
+void PairwiseSwapSearch(std::vector<size_t>& remapping, const AdjList& adj,
                         uint8_t max_dist) {
   size_t num_colors = remapping.size();
   size_t b_limit =
       (max_dist == 0) ? num_colors : (static_cast<size_t>(max_dist) + 1);
+
+  std::vector<size_t> pos(num_colors);
+  for (size_t i = 0; i < num_colors; ++i) {
+    pos[remapping[i]] = i;
+  }
 
   int swaps = 1;
   int iter = 0;
@@ -290,22 +321,28 @@ void PairwiseSwapSearch(std::vector<size_t>& remapping,
     iter++;
     for (size_t a = 0; a + 1 < num_colors; a++) {
       size_t limit = std::min(num_colors, a + b_limit);
+      int64_t pos_a = static_cast<int64_t>(a);
       for (size_t b = a + 1; b < limit; b++) {
         size_t va = remapping[a];
         size_t vb = remapping[b];
+        int64_t pos_b = static_cast<int64_t>(b);
         int64_t delta = 0;
-        for (size_t i = 0; i < num_colors; i++) {
-          if (i == a || i == b) continue;
-          size_t vi = remapping[i];
-          int64_t weight_diff =
-              static_cast<int64_t>(matrix[va][vi]) - matrix[vb][vi];
-          int64_t dist_diff =
-              std::abs(static_cast<int64_t>(b) - static_cast<int64_t>(i)) -
-              std::abs(static_cast<int64_t>(a) - static_cast<int64_t>(i));
-          delta += weight_diff * dist_diff;
+        for (const auto& edge : adj[va]) {
+          if (edge.to == vb) continue;
+          int64_t pos_i = static_cast<int64_t>(pos[edge.to]);
+          delta +=
+              edge.weight * (std::abs(pos_b - pos_i) - std::abs(pos_a - pos_i));
+        }
+        for (const auto& edge : adj[vb]) {
+          if (edge.to == va) continue;
+          int64_t pos_i = static_cast<int64_t>(pos[edge.to]);
+          delta -=
+              edge.weight * (std::abs(pos_b - pos_i) - std::abs(pos_a - pos_i));
         }
         if (delta < 0) {
           std::swap(remapping[a], remapping[b]);
+          pos[va] = b;
+          pos[vb] = a;
           swaps += 1;
         }
       }
@@ -313,9 +350,13 @@ void PairwiseSwapSearch(std::vector<size_t>& remapping,
   }
 }
 
-void TwoOptSearch(std::vector<size_t>& remapping,
-                  const std::vector<std::vector<uint32_t>>& matrix) {
+void TwoOptSearch(std::vector<size_t>& remapping, const AdjList& adj) {
   size_t n = remapping.size();
+  std::vector<size_t> pos(n);
+  for (size_t i = 0; i < n; ++i) {
+    pos[remapping[i]] = i;
+  }
+
   bool improved = true;
   int iter = 0;
   while (improved && iter < 10) {
@@ -325,24 +366,27 @@ void TwoOptSearch(std::vector<size_t>& remapping,
       size_t b_limit = std::min(n, a + 33);
       for (size_t b = a + 1; b < b_limit; b++) {
         int64_t delta = 0;
+        int64_t ab = static_cast<int64_t>(a + b);
         for (size_t k = a; k <= b; k++) {
+          int64_t factor = ab - 2 * static_cast<int64_t>(k);
+          if (factor == 0) continue;
           size_t vk = remapping[k];
-          int64_t old_pos = static_cast<int64_t>(k);
-          int64_t new_pos = static_cast<int64_t>(a + b - k);
-          if (old_pos == new_pos) continue;
-          for (size_t i = 0; i < n; i++) {
-            if (i >= a && i <= b) continue;
-            uint32_t w = matrix[vk][remapping[i]];
-            if (w > 0) {
-              int64_t pos_i = static_cast<int64_t>(i);
-              int64_t old_d = std::abs(old_pos - pos_i);
-              int64_t new_d = std::abs(new_pos - pos_i);
-              delta += static_cast<int64_t>(w) * (new_d - old_d);
+          int64_t diff_k = 0;
+          for (const auto& edge : adj[vk]) {
+            size_t pi = pos[edge.to];
+            if (pi < a) {
+              diff_k += edge.weight;
+            } else if (pi > b) {
+              diff_k -= edge.weight;
             }
           }
+          delta += factor * diff_k;
         }
         if (delta < 0) {
           std::reverse(remapping.begin() + a, remapping.begin() + b + 1);
+          for (size_t k = a; k <= b; ++k) {
+            pos[remapping[k]] = k;
+          }
           improved = true;
         }
       }
@@ -807,9 +851,10 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
       } else {
         JXL_DEBUG_V(7, "Palette of %i colors, using ezeng order", nb_colors);
 
+        AdjList adj = BuildAdjList(matrix);
         std::vector<size_t> remapping = EZengReindex(matrix);
-        PairwiseSwapSearch(remapping, matrix, 50);
-        TwoOptSearch(remapping, matrix);
+        PairwiseSwapSearch(remapping, adj, 50);
+        TwoOptSearch(remapping, adj);
         OrientRemapping(remapping, candidate_palette_imageorder,
                         color_freq_map);
 
