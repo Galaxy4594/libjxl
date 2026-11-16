@@ -681,14 +681,15 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
   }
   int clr = 0;
   if (ordered && !candidate_palette_imageorder.empty()) {
-    if (zero_predictor_mode) {
+    if (zero_predictor_mode || candidate_palette_imageorder.size() > 1024) {
       JXL_DEBUG_V(7,
                   "Palette of %i colors, using lexicographical order (zero "
-                  "predictor / LZ77 mode)",
+                  "predictor / large palette mode)",
                   nb_colors);
       std::sort(candidate_palette_imageorder.begin(),
                 candidate_palette_imageorder.end());
-      if (candidate_palette_imageorder.size() > 2) {
+      if (zero_predictor_mode && candidate_palette_imageorder.size() > 2 &&
+          candidate_palette_imageorder.size() <= 1024) {
         size_t f_front = color_freq_map[candidate_palette_imageorder.front()];
         size_t f_back = color_freq_map[candidate_palette_imageorder.back()];
         if (f_back > f_front) {
