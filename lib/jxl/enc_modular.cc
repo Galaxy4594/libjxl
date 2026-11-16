@@ -389,7 +389,8 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       // Group palette: small tiles benefit less from large palettes due to
       // header overhead; also if the entropy (estimated bpp) is low (e.g.
       // mostly solid/gradient areas), palette is less useful.
-      if (is_global || zero_pred_mode) {
+      if (is_global || zero_pred_mode ||
+          cparams_.speed_tier < SpeedTier::kSquirrel) {
         maybe_palette.nb_colors = std::min(static_cast<int>(nb_pixels / 2),
                                            std::abs(cparams_.palette_colors));
       } else {
@@ -417,7 +418,8 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       Transform maybe_palette_3(TransformId::kPalette);
       maybe_palette_3.begin_c = gi.nb_meta_channels;
       maybe_palette_3.num_c = nb_chans - 1;
-      if (is_global || zero_pred_mode) {
+      if (is_global || zero_pred_mode ||
+          cparams_.speed_tier < SpeedTier::kSquirrel) {
         maybe_palette_3.nb_colors = std::min(static_cast<int>(nb_pixels / 3),
                                              std::abs(cparams_.palette_colors));
       } else {
