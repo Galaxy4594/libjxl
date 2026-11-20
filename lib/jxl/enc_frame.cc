@@ -708,8 +708,8 @@ void ComputeNoiseParams(const CompressParams& cparams, bool streaming_mode,
   }
   if (cparams.photon_noise_iso > 0) {
     FrameDimensions full_frame_dim = frame_header->ToFrameDimensions();
-    *noise_params = SimulatePhotonNoise(full_frame_dim.xsize, full_frame_dim.ysize,
-                                        cparams.photon_noise_iso);
+    *noise_params = SimulatePhotonNoise(
+        full_frame_dim.xsize, full_frame_dim.ysize, cparams.photon_noise_iso);
   } else if (cparams.manual_noise.size() == NoiseParams::kNumNoisePoints) {
     for (size_t i = 0; i < NoiseParams::kNumNoisePoints; i++) {
       noise_params->lut[i] = cparams.manual_noise[i];
@@ -2523,7 +2523,12 @@ std::vector<CompressParams> TectonicPlateSettingsMorePalette(
   all_params.push_back(cparams_attempt);
   cparams_attempt.patches = Override::kOff;
   cparams_attempt.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
+  cparams_attempt.options.nb_repeats = 1.0f;
+  cparams_attempt.decoding_speed_tier = 1;
+  cparams_attempt.speed_tier = SpeedTier::kTortoise;
   all_params.push_back(cparams_attempt);
+  cparams_attempt.decoding_speed_tier = cparams_orig.decoding_speed_tier;
+  cparams_attempt.speed_tier = SpeedTier::kGlacier;
   cparams_attempt.options.nb_repeats = 0.5f;
   all_params.push_back(cparams_attempt);
   cparams_attempt.options.wp_tree_mode = ModularOptions::TreeMode::kDefault;

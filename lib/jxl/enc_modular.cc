@@ -344,9 +344,9 @@ StatusOr<bool> maybe_do_transform(Image& image, const Transform& tr,
     float threshold = cost_before;
     if (cparams.options.predictor == Predictor::Zero) {
       // In zero-predictor mode (LZ77-dominated), EstimateCost (which assumes
-      // weighted predictor without LZ77) is only an approximation. Allow a
-      // small tolerance so beneficial palettes are not rejected by noise.
-      threshold *= 1.01f;
+      // ClampedGradient predictor without LZ77) is only a rough approximation
+      // and overestimates residuals on large 1D palette indices (> 256).
+      threshold *= 1.15f;
     }
     if (cost_after > threshold) {
       Transform t = image.transform.back();

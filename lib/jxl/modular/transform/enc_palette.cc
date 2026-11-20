@@ -732,13 +732,63 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
                   nb_colors);
       std::sort(candidate_palette_imageorder.begin(),
                 candidate_palette_imageorder.end());
-      if (zero_predictor_mode && candidate_palette_imageorder.size() > 2 &&
-          candidate_palette_imageorder.size() <= 1024) {
-        size_t f_front = color_freq_map[candidate_palette_imageorder.front()];
-        size_t f_back = color_freq_map[candidate_palette_imageorder.back()];
-        if (f_back > f_front) {
+      const size_t n_pal = candidate_palette_imageorder.size();
+      if (zero_predictor_mode && n_pal > 2) {
+        size_t max_freq = 0;
+        size_t max_freq_idx = 0;
+        for (size_t i = 0; i < n_pal; ++i) {
+          size_t f = color_freq_map[candidate_palette_imageorder[i]];
+          if (f > max_freq) {
+            max_freq = f;
+            max_freq_idx = i;
+          }
+        }
+        if (max_freq_idx > n_pal / 2) {
           std::reverse(candidate_palette_imageorder.begin(),
                        candidate_palette_imageorder.end());
+        }
+        const size_t dom_thresh = (w * h > 65536) ? 64 : (w * h) / 4;
+        std::stable_sort(candidate_palette_imageorder.begin(),
+                         candidate_palette_imageorder.end(),
+                         [&](const std::vector<pixel_type>& a,
+                             const std::vector<pixel_type>& b) {
+                           size_t fa = color_freq_map[a];
+                           size_t fb = color_freq_map[b];
+                           bool dom_a = (fa >= dom_thresh);
+                           bool dom_b = (fb >= dom_thresh);
+                           if (dom_a != dom_b) return dom_a > dom_b;
+                           if (dom_a && dom_b) return fa > fb;
+                           return false;
+                         });
+      } else if (!zero_predictor_mode && n_pal > 1024) {
+        auto rgb_dist = [&](const std::vector<pixel_type>& a,
+                            const std::vector<pixel_type>& b) -> int64_t {
+          int64_t d = 0;
+          for (size_t c = 0; c < nb; ++c) {
+            d += std::abs(static_cast<int64_t>(a[c]) -
+                          static_cast<int64_t>(b[c]));
+          }
+          return d;
+        };
+        for (size_t i = 1; i < n_pal; ++i) {
+          size_t best_ix = i;
+          int64_t best_score = std::numeric_limits<int64_t>::max();
+          const auto& prev = candidate_palette_imageorder[i - 1];
+          for (size_t k = i; k < n_pal; ++k) {
+            int64_t score = rgb_dist(prev, candidate_palette_imageorder[k]);
+            if (score < best_score) {
+              best_score = score;
+              best_ix = k;
+            }
+          }
+          if (best_ix != i) {
+            auto chosen = std::move(candidate_palette_imageorder[best_ix]);
+            for (size_t k = best_ix; k > i; --k) {
+              candidate_palette_imageorder[k] =
+                  std::move(candidate_palette_imageorder[k - 1]);
+            }
+            candidate_palette_imageorder[i] = std::move(chosen);
+          }
         }
       }
     } else {
