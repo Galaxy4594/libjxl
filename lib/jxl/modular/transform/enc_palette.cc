@@ -394,6 +394,23 @@ void TwoOptSearch(std::vector<size_t>& remapping, const AdjList& adj) {
   }
 }
 
+bool PaletteHasNonMonotonousDeltas(
+    const std::vector<std::vector<pixel_type>>& palette, size_t nb) {
+  if (palette.size() <= 2) return false;
+  for (size_t c = 0; c < nb; ++c) {
+    bool has_pos = false;
+    bool has_neg = false;
+    for (size_t i = 1; i < palette.size(); ++i) {
+      int64_t d = static_cast<int64_t>(palette[i][c]) -
+                  static_cast<int64_t>(palette[i - 1][c]);
+      if (d > 0) has_pos = true;
+      if (d < 0) has_neg = true;
+      if (has_pos && has_neg) return true;
+    }
+  }
+  return false;
+}
+
 void OrientRemapping(
     std::vector<size_t>& remapping,
     const std::vector<std::vector<pixel_type>>& palette,
@@ -760,7 +777,9 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
                            if (dom_a && dom_b) return fa > fb;
                            return false;
                          });
-      } else if (!zero_predictor_mode && n_pal > 1024) {
+      } else if (!zero_predictor_mode && n_pal > 1024 &&
+                 PaletteHasNonMonotonousDeltas(candidate_palette_imageorder,
+                                               nb)) {
         auto rgb_dist = [&](const std::vector<pixel_type>& a,
                             const std::vector<pixel_type>& b) -> int64_t {
           int64_t d = 0;
