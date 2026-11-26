@@ -1070,41 +1070,155 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
                  (n_pal <= 1024 || palette_effort >= 1) &&
                  PaletteHasNonMonotonousDeltas(candidate_palette_imageorder,
                                                nb)) {
-        auto rgb_dist = [&](const std::vector<pixel_type>& a,
-                            const std::vector<pixel_type>& b) -> int64_t {
-          int64_t d = 0;
-          for (size_t c = 0; c < nb; ++c) {
-            d += std::abs(static_cast<int64_t>(a[c]) -
-                          static_cast<int64_t>(b[c]));
+        auto minimize_deltas = [&](std::vector<std::vector<pixel_type>>& pal) {
+          const size_t m = pal.size();
+          if (m <= 2 || !PaletteHasNonMonotonousDeltas(pal, nb)) return;
+          auto rgb_dist = [&](const std::vector<pixel_type>& a,
+                              const std::vector<pixel_type>& b) -> int64_t {
+            int64_t d = 0;
+            for (size_t c = 0; c < nb; ++c) {
+              d += std::abs(static_cast<int64_t>(a[c]) -
+                            static_cast<int64_t>(b[c]));
+            }
+            return d;
+          };
+          for (size_t i = 1; i < m; ++i) {
+            size_t best_ix = i;
+            int64_t best_score = std::numeric_limits<int64_t>::max();
+            const auto& prev = pal[i - 1];
+            for (size_t k = i; k < m; ++k) {
+              int64_t score = rgb_dist(prev, pal[k]);
+              if (score < best_score) {
+                best_score = score;
+                best_ix = k;
+              }
+            }
+            if (best_ix != i) {
+              auto chosen = std::move(pal[best_ix]);
+              for (size_t k = best_ix; k > i; --k) {
+                pal[k] = std::move(pal[k - 1]);
+              }
+              pal[i] = std::move(chosen);
+            }
           }
-          return d;
         };
-        for (size_t i = 1; i < n_pal; ++i) {
-          size_t best_ix = i;
-          int64_t best_score = std::numeric_limits<int64_t>::max();
-          const auto& prev = candidate_palette_imageorder[i - 1];
-          for (size_t k = i; k < n_pal; ++k) {
-            int64_t score = rgb_dist(prev, candidate_palette_imageorder[k]);
-            if (score < best_score) {
-              best_score = score;
-              best_ix = k;
-            }
+
+        // For large palettes (> 1024 colors) dominated by a small set of common
+        // colors (e.g. screenshots / pixel art with many rare anti-aliased
+        // colors), partition the top <= 512 common colors to the front and
+        // optimize them with EZeng + Swap (+ 2-Opt), while keeping the rare
+        // tail compact via MinimizeDeltas.
+        bool did_partition = false;
+        if (n_pal > 1024) {
+          std::vector<std::pair<size_t, size_t>> freq_idx;
+          freq_idx.reserve(n_pal);
+          for (size_t i = 0; i < n_pal; ++i) {
+            auto it = color_freq_map.find(candidate_palette_imageorder[i]);
+            size_t f = (it != color_freq_map.end()) ? it->second : 0;
+            freq_idx.push_back({f, i});
           }
-          if (best_ix != i) {
-            auto chosen = std::move(candidate_palette_imageorder[best_ix]);
-            for (size_t k = best_ix; k > i; --k) {
-              candidate_palette_imageorder[k] =
-                  std::move(candidate_palette_imageorder[k - 1]);
+          constexpr size_t kMaxCommon = 512;
+          size_t k_limit = std::min(kMaxCommon, n_pal);
+          std::partial_sort(
+              freq_idx.begin(), freq_idx.begin() + k_limit, freq_idx.end(),
+              [](const std::pair<size_t, size_t>& a,
+                 const std::pair<size_t, size_t>& b) {
+                if (a.first != b.first) return a.first > b.first;
+                return a.second < b.second;
+              });
+          size_t num_common = 0;
+          uint64_t common_pixels = 0;
+          while (num_common < k_limit && freq_idx[num_common].first > 4) {
+            common_pixels += freq_idx[num_common].first;
+            num_common++;
+          }
+          if (num_common >= 8 &&
+              common_pixels * 5 >= static_cast<uint64_t>(w) * h * 4) {
+            did_partition = true;
+            std::vector<uint8_t> is_common(n_pal, 0);
+            std::vector<std::vector<pixel_type>> common_pal;
+            common_pal.reserve(num_common);
+            for (size_t i = 0; i < num_common; ++i) {
+              is_common[freq_idx[i].second] = 1;
+              common_pal.push_back(
+                  std::move(candidate_palette_imageorder[freq_idx[i].second]));
             }
-            candidate_palette_imageorder[i] = std::move(chosen);
+            std::vector<std::vector<pixel_type>> rare_pal;
+            rare_pal.reserve(n_pal - num_common);
+            for (size_t i = 0; i < n_pal; ++i) {
+              if (!is_common[i]) {
+                rare_pal.push_back(std::move(candidate_palette_imageorder[i]));
+              }
+            }
+
+            // Order common colors by spatial co-occurrence (EZeng + Swap +
+            // 2-Opt).
+            FastColorMap common_map;
+            common_map.Init(common_pal);
+            std::vector<std::vector<uint32_t>> matrix(
+                num_common, std::vector<uint32_t>(num_common, 0));
+            std::vector<int> prev_row(w, -1);
+            for (size_t y = 0; y < h; ++y) {
+              for (uint32_t c = 0; c < nb; ++c) {
+                p_in[c] = input.channel[begin_c + c].Row(y);
+              }
+              int prev_val = -1;
+              for (size_t x = 0; x < w; ++x) {
+                for (uint32_t c = 0; c < nb; ++c) color[c] = p_in[c][x];
+                int val = common_map.Find(color);
+                if (val != -1) {
+                  if (prev_val != -1) matrix[prev_val][val]++;
+                  if (prev_row[x] != -1) matrix[prev_row[x]][val]++;
+                  prev_val = val;
+                  prev_row[x] = val;
+                } else {
+                  prev_val = -1;
+                  prev_row[x] = -1;
+                }
+              }
+            }
+            for (size_t i = 0; i < num_common; ++i) {
+              for (size_t j = 0; j < num_common; ++j) {
+                matrix[j][i] += matrix[i][j];
+                matrix[i][j] = matrix[j][i];
+              }
+            }
+            AdjList adj = BuildAdjList(matrix);
+            std::vector<size_t> remapping = EZengReindex(matrix);
+            if (palette_effort >= 2) {
+              PairwiseSwapSearch(remapping, adj, 50, 50);
+              TwoOptSearch(remapping, adj);
+            } else {
+              PairwiseSwapSearch(remapping, adj, 20, 10);
+            }
+            OrientRemapping(remapping, common_pal, color_freq_map);
+
+            // Order rare tail by MinimizeDeltas (already lexicographically
+            // sorted).
+            minimize_deltas(rare_pal);
+
+            candidate_palette_imageorder.clear();
+            candidate_palette_imageorder.reserve(n_pal);
+            for (size_t i = 0; i < num_common; ++i) {
+              candidate_palette_imageorder.push_back(
+                  std::move(common_pal[remapping[i]]));
+            }
+            for (auto& c : rare_pal) {
+              candidate_palette_imageorder.push_back(std::move(c));
+            }
           }
         }
-        if (n_pal <= 1024 && n_pal > 2) {
-          size_t f_front = color_freq_map[candidate_palette_imageorder.front()];
-          size_t f_back = color_freq_map[candidate_palette_imageorder.back()];
-          if (f_back > f_front) {
-            std::reverse(candidate_palette_imageorder.begin(),
-                         candidate_palette_imageorder.end());
+
+        if (!did_partition) {
+          minimize_deltas(candidate_palette_imageorder);
+          if (n_pal <= 1024 && n_pal > 2) {
+            size_t f_front =
+                color_freq_map[candidate_palette_imageorder.front()];
+            size_t f_back = color_freq_map[candidate_palette_imageorder.back()];
+            if (f_back > f_front) {
+              std::reverse(candidate_palette_imageorder.begin(),
+                           candidate_palette_imageorder.end());
+            }
           }
         }
       }
