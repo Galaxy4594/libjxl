@@ -19,7 +19,7 @@ Status FwdPalette(Image& input, uint32_t begin_c, uint32_t end_c,
                   uint32_t& nb_colors, uint32_t& nb_deltas, bool ordered,
                   bool lossy, Predictor& predictor,
                   const weighted::Header& wp_header,
-                  bool zero_predictor_mode = false);
+                  bool zero_predictor_mode = false, int palette_effort = 2);
 
 }  // namespace jxl
 

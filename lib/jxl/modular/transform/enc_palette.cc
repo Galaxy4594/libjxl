@@ -305,7 +305,7 @@ std::vector<size_t> EZengReindex(
 }
 
 void PairwiseSwapSearch(std::vector<size_t>& remapping, const AdjList& adj,
-                        uint8_t max_dist) {
+                        uint8_t max_dist, int max_iter = 50) {
   size_t num_colors = remapping.size();
   size_t b_limit =
       (max_dist == 0) ? num_colors : (static_cast<size_t>(max_dist) + 1);
@@ -317,7 +317,7 @@ void PairwiseSwapSearch(std::vector<size_t>& remapping, const AdjList& adj,
 
   int swaps = 1;
   int iter = 0;
-  while (swaps > 0 && iter < 50) {
+  while (swaps > 0 && iter < max_iter) {
     swaps = 0;
     iter++;
     for (size_t a = 0; a + 1 < num_colors; a++) {
@@ -798,7 +798,8 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
                            bool ordered, bool lossy, Predictor& predictor,
                            const weighted::Header& wp_header,
                            PaletteIterationData& palette_iteration_data,
-                           bool zero_predictor_mode = false) {
+                           bool zero_predictor_mode = false,
+                           int palette_effort = 2) {
   JXL_QUIET_RETURN_IF_ERROR(CheckEqualChannels(input, begin_c, end_c));
   JXL_ENSURE(begin_c >= input.nb_meta_channels);
   JxlMemoryManager* memory_manager = input.memory_manager();
@@ -1042,10 +1043,11 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
   }
   int clr = 0;
   if (ordered && !candidate_palette_imageorder.empty()) {
-    if (zero_predictor_mode || candidate_palette_imageorder.size() > 1024) {
+    if (zero_predictor_mode || palette_effort == 0 ||
+        candidate_palette_imageorder.size() > 1024) {
       JXL_DEBUG_V(7,
-                  "Palette of %i colors, using lexicographical order (zero "
-                  "predictor / large palette mode)",
+                  "Palette of %i colors, using lexicographical/delta order "
+                  "(zero predictor / fast / large palette mode)",
                   nb_colors);
       std::sort(candidate_palette_imageorder.begin(),
                 candidate_palette_imageorder.end());
@@ -1077,7 +1079,8 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
                            if (dom_a && dom_b) return fa > fb;
                            return false;
                          });
-      } else if (!zero_predictor_mode && n_pal > 1024 &&
+      } else if (!zero_predictor_mode &&
+                 (n_pal <= 1024 || palette_effort >= 1) &&
                  PaletteHasNonMonotonousDeltas(candidate_palette_imageorder,
                                                nb)) {
         auto rgb_dist = [&](const std::vector<pixel_type>& a,
@@ -1109,7 +1112,69 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
             candidate_palette_imageorder[i] = std::move(chosen);
           }
         }
+        if (n_pal > 2) {
+          size_t f_front = color_freq_map[candidate_palette_imageorder.front()];
+          size_t f_back = color_freq_map[candidate_palette_imageorder.back()];
+          if (f_back > f_front) {
+            std::reverse(candidate_palette_imageorder.begin(),
+                         candidate_palette_imageorder.end());
+          }
+        }
       }
+    } else if (palette_effort == 1) {
+      // Medium-effort path (efforts 4-6): EZeng + light pairwise swap without
+      // 2-opt or multi-candidate pixel-level cost evaluation.
+      size_t num_colors = candidate_palette_imageorder.size();
+      FastColorMap color_map;
+      color_map.Init(candidate_palette_imageorder);
+
+      std::vector<std::vector<uint32_t>> matrix(
+          num_colors, std::vector<uint32_t>(num_colors, 0));
+      std::vector<int> prev_row(w, -1);
+
+      for (size_t y = 0; y < h; y++) {
+        for (uint32_t c = 0; c < nb; c++) {
+          p_in[c] = input.channel[begin_c + c].Row(y);
+        }
+        int prev_val = -1;
+        for (size_t x = 0; x < w; x++) {
+          for (uint32_t c = 0; c < nb; c++) {
+            color[c] = p_in[c][x];
+          }
+          int val = color_map.Find(color);
+          if (val != -1) {
+            if (prev_val != -1) {
+              matrix[prev_val][val]++;
+            }
+            if (prev_row[x] != -1) {
+              matrix[prev_row[x]][val]++;
+            }
+            prev_val = val;
+            prev_row[x] = val;
+          } else {
+            prev_val = -1;
+            prev_row[x] = -1;
+          }
+        }
+      }
+
+      for (size_t i = 0; i < num_colors; i++) {
+        for (size_t j = 0; j < num_colors; j++) {
+          matrix[j][i] += matrix[i][j];
+          matrix[i][j] = matrix[j][i];
+        }
+      }
+
+      AdjList adj = BuildAdjList(matrix);
+      std::vector<size_t> remapping = EZengReindex(matrix);
+      PairwiseSwapSearch(remapping, adj, 20, 10);
+      OrientRemapping(remapping, candidate_palette_imageorder, color_freq_map);
+
+      std::vector<std::vector<pixel_type>> new_order(num_colors);
+      for (size_t i = 0; i < num_colors; ++i) {
+        new_order[i] = candidate_palette_imageorder[remapping[i]];
+      }
+      candidate_palette_imageorder = std::move(new_order);
     } else {
       size_t num_colors = candidate_palette_imageorder.size();
       FastColorMap color_map;
@@ -1470,7 +1535,8 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
 Status FwdPalette(Image& input, uint32_t begin_c, uint32_t end_c,
                   uint32_t& nb_colors, uint32_t& nb_deltas, bool ordered,
                   bool lossy, Predictor& predictor,
-                  const weighted::Header& wp_header, bool zero_predictor_mode) {
+                  const weighted::Header& wp_header, bool zero_predictor_mode,
+                  int palette_effort) {
   PaletteIterationData palette_iteration_data;
   uint32_t nb_colors_orig = nb_colors;
   uint32_t nb_deltas_orig = nb_deltas;
@@ -1478,12 +1544,13 @@ Status FwdPalette(Image& input, uint32_t begin_c, uint32_t end_c,
   if (lossy && input.bitdepth >= 8) {
     JXL_RETURN_IF_ERROR(FwdPaletteIteration(
         input, begin_c, end_c, nb_colors_orig, nb_deltas_orig, ordered, lossy,
-        predictor, wp_header, palette_iteration_data, zero_predictor_mode));
+        predictor, wp_header, palette_iteration_data, zero_predictor_mode,
+        palette_effort));
   }
   palette_iteration_data.final_run = true;
-  return FwdPaletteIteration(input, begin_c, end_c, nb_colors, nb_deltas,
-                             ordered, lossy, predictor, wp_header,
-                             palette_iteration_data, zero_predictor_mode);
+  return FwdPaletteIteration(
+      input, begin_c, end_c, nb_colors, nb_deltas, ordered, lossy, predictor,
+      wp_header, palette_iteration_data, zero_predictor_mode, palette_effort);
 }
 
 }  // namespace jxl

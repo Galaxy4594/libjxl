@@ -57,6 +57,9 @@ class Transform : public Fields {
   bool ordered_palette = true;
   bool lossy_palette = false;
   bool zero_predictor_mode = false;
+  // 0 = fast (MinimizeDeltas), 1 = medium (EZeng + light swap),
+  // 2 = full (EZeng + swap + 2-opt + 3-candidate cost scoring).
+  int palette_effort = 2;
 
   explicit Transform(TransformId id);
   // default constructor for bundles.

@@ -384,6 +384,14 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
     const bool zero_pred_mode =
         (cparams_.options.predictor == Predictor::Zero) &&
         (cparams_.speed_tier < SpeedTier::kFalcon);
+    // Gate heavier palette ordering algorithms by speed tier:
+    // 0 (efforts 1-3): fast MinimizeDeltas (no co-occurrence graph or search)
+    // 1 (efforts 4-6): EZeng + light pairwise swap (no 2-opt or cost scoring)
+    // 2 (efforts 7+):  full EZeng + swap + 2-opt + 3-candidate cost scoring
+    const int palette_effort = (cparams_.speed_tier >= SpeedTier::kFalcon) ? 0
+                               : (cparams_.speed_tier > SpeedTier::kSquirrel)
+                                   ? 1
+                                   : 2;
     // all-channel palette (e.g. RGBA)
     if (nb_chans > 1) {
       Transform maybe_palette(TransformId::kPalette);
@@ -409,6 +417,7 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
         maybe_palette.predictor = Predictor::Average4;
       }
       maybe_palette.zero_predictor_mode = zero_pred_mode;
+      maybe_palette.palette_effort = palette_effort;
       // TODO(veluca): use a custom weighted header if using the weighted
       // predictor.
       JXL_ASSIGN_OR_RETURN(
@@ -436,6 +445,7 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
         maybe_palette_3.predictor = Predictor::Average4;
       }
       maybe_palette_3.zero_predictor_mode = zero_pred_mode;
+      maybe_palette_3.palette_effort = palette_effort;
       JXL_ASSIGN_OR_RETURN(
           did_palette,
           maybe_do_transform(gi, maybe_palette_3, cparams_, weighted::Header(),
