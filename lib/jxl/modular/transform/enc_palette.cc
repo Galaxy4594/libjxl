@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "lib/jxl/base/bits.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/status.h"
@@ -392,6 +393,305 @@ void TwoOptSearch(std::vector<size_t>& remapping, const AdjList& adj) {
       }
     }
   }
+}
+
+// Identifies pixels covered by exact 2D (current + top row) repeated runs
+// within each 256x256 tile. Because any palette reordering is a bijection,
+// ClampedGradient residuals inside such repeated runs are identical across
+// all orderings and get collapsed by LZ77 independently of palette order.
+std::vector<uint8_t> ComputeLZ77MatchMask(const std::vector<uint16_t>& idx_img,
+                                          size_t w, size_t h) {
+  std::vector<uint8_t> mask(w * h, 0);
+  const bool tiled = (w > 256 || h > 256);
+  const size_t tile_dim = tiled ? 256 : std::max(w, h);
+  constexpr size_t kHashSize = 4096;
+  constexpr size_t kHashMask = kHashSize - 1;
+  std::vector<int32_t> head(kHashSize, -1);
+
+  for (size_t y0 = 0; y0 < h; y0 += tile_dim) {
+    const size_t y1 = std::min(h, y0 + tile_dim);
+    for (size_t x0 = 0; x0 < w; x0 += tile_dim) {
+      const size_t x1 = std::min(w, x0 + tile_dim);
+      const size_t tw = x1 - x0;
+      if (tw < 4 || y1 - y0 < 2) continue;
+      std::fill(head.begin(), head.end(), -1);
+
+      for (size_t y = y0 + 1; y < y1; ++y) {
+        const uint16_t* row = &idx_img[y * w];
+        const uint16_t* prev = &idx_img[(y - 1) * w];
+        size_t x = x0;
+        while (x + 4 <= x1) {
+          // Skip flat runs (already handled by zero-run RLE).
+          if (row[x] == row[x + 1] && row[x] == row[x + 2] &&
+              row[x] == row[x + 3] && row[x] == prev[x] &&
+              row[x] == prev[x + 1] && row[x] == prev[x + 2] &&
+              row[x] == prev[x + 3]) {
+            x++;
+            continue;
+          }
+          uint64_t hval = (static_cast<uint64_t>(row[x]) * 2654435761ULL) ^
+                          (static_cast<uint64_t>(row[x + 1]) * 2246822519ULL) ^
+                          (static_cast<uint64_t>(row[x + 2]) * 3266489917ULL) ^
+                          (static_cast<uint64_t>(row[x + 3]) * 668265263ULL) ^
+                          (static_cast<uint64_t>(prev[x]) * 374761393ULL) ^
+                          (static_cast<uint64_t>(prev[x + 1]) * 1274126177ULL) ^
+                          (static_cast<uint64_t>(prev[x + 2]) * 2869860233ULL) ^
+                          (static_cast<uint64_t>(prev[x + 3]) * 1640531527ULL);
+          size_t bucket = (hval >> 20) & kHashMask;
+          int32_t prev_pos = head[bucket];
+          int32_t cur_pos = static_cast<int32_t>((y - y0) * tw + (x - x0));
+          head[bucket] = cur_pos;
+
+          if (prev_pos >= 0) {
+            size_t qy = y0 + static_cast<size_t>(prev_pos) / tw;
+            size_t qx = x0 + static_cast<size_t>(prev_pos) % tw;
+            if (qx + 4 <= x1) {
+              const uint16_t* qrow = &idx_img[qy * w];
+              const uint16_t* qprev = &idx_img[(qy - 1) * w];
+              if (row[x] == qrow[qx] && row[x + 1] == qrow[qx + 1] &&
+                  row[x + 2] == qrow[qx + 2] && row[x + 3] == qrow[qx + 3] &&
+                  prev[x] == qprev[qx] && prev[x + 1] == qprev[qx + 1] &&
+                  prev[x + 2] == qprev[qx + 2] &&
+                  prev[x + 3] == qprev[qx + 3]) {
+                size_t len = 4;
+                size_t max_len = std::min(x1 - x, x1 - qx);
+                while (len < max_len && row[x + len] == qrow[qx + len] &&
+                       prev[x + len] == qprev[qx + len]) {
+                  len++;
+                }
+                // Residuals at x+1..x+len-1 are guaranteed identical under any
+                // palette permutation (since cur, left, top, topleft all
+                // match).
+                for (size_t k = 1; k < len; ++k) {
+                  mask[y * w + x + k] = 1;
+                }
+                x += len;
+                continue;
+              }
+            }
+          }
+          x++;
+        }
+      }
+    }
+  }
+  return mask;
+}
+
+double EvaluatePaletteOrderCost(
+    const std::vector<uint16_t>& idx_img, const std::vector<uint8_t>& lz_mask,
+    size_t w, size_t h, const std::vector<std::vector<pixel_type>>& palette,
+    const std::vector<size_t>& remapping, size_t nb) {
+  const size_t n = remapping.size();
+  std::vector<int32_t> pos(n);
+  for (size_t i = 0; i < n; ++i) {
+    pos[remapping[i]] = static_cast<int32_t>(i);
+  }
+
+  // Approximate bit cost of HybridUint (4, 1, 0) + multi-context Shannon
+  // entropy on ClampedGradient residuals over the palette index channel,
+  // with zero-run discounting to model LZ77 + MA tree behavior.
+  constexpr size_t kNumCtx = 8;
+  constexpr size_t kMaxTokens = 64;
+  uint64_t counts[kNumCtx][kMaxTokens] = {};
+  uint64_t ctx_totals[kNumCtx] = {};
+  double extra_bits = 0.0;
+
+  auto push_token = [&](size_t ctx, int32_t res) {
+    uint32_t v =
+        static_cast<uint32_t>(res >= 0 ? (res << 1) : ((-res << 1) - 1));
+    uint32_t tok;
+    if (v < 16) {
+      tok = v;
+    } else {
+      uint32_t nbits = FloorLog2Nonzero(v);
+      tok = 16 + ((nbits - 4) << 1) + ((v >> (nbits - 1)) & 1);
+      if (tok >= kMaxTokens) tok = kMaxTokens - 1;
+      extra_bits += static_cast<double>(nbits - 1);
+    }
+    counts[ctx][tok]++;
+    ctx_totals[ctx]++;
+  };
+
+  auto flush_zero_run = [&](uint32_t& run_len, size_t run_ctx) {
+    if (run_len == 0) return;
+    if (run_len <= 2) {
+      counts[run_ctx][0] += run_len;
+      ctx_totals[run_ctx] += run_len;
+    } else {
+      // Model an LZ77 distance-1 match of length `run_len`.
+      counts[run_ctx][0]++;
+      ctx_totals[run_ctx]++;
+      extra_bits += 2.0 + std::log2(static_cast<double>(run_len));
+    }
+    run_len = 0;
+  };
+
+  // Subsample rows on very large images to keep evaluation fast (~2ms).
+  const size_t y_step = (w * h > 524288) ? 2 : 1;
+  const int32_t implicit_idx = static_cast<int32_t>(n);
+  const bool simulate_groups = (w > 256 || h > 256);
+  const size_t tile_dim = simulate_groups ? 256 : std::max(w, h);
+  double compact_pal_bits = 0.0;
+
+  std::vector<uint8_t> present(n + 1);
+  std::vector<int32_t> local_pos(n + 1);
+
+  for (size_t y0 = 0; y0 < h; y0 += tile_dim) {
+    const size_t y1 = std::min(h, y0 + tile_dim);
+    for (size_t x0 = 0; x0 < w; x0 += tile_dim) {
+      const size_t x1 = std::min(w, x0 + tile_dim);
+      const size_t tw = x1 - x0;
+      const size_t th = y1 - y0;
+
+      // Simulate per-group ChannelCompact (1D channel palette) that
+      // enc_modular.cc applies to sparse 256x256 groups after a global palette.
+      bool use_compact = false;
+      if (simulate_groups && n > 16) {
+        std::fill(present.begin(), present.end(), 0);
+        int32_t min_v = static_cast<int32_t>(n);
+        int32_t max_v = 0;
+        for (size_t y = y0; y < y1; ++y) {
+          const uint16_t* row = &idx_img[y * w];
+          for (size_t x = x0; x < x1; ++x) {
+            uint16_t raw = row[x];
+            int32_t v = (raw < n) ? pos[raw] : implicit_idx;
+            present[v] = 1;
+            if (v < min_v) min_v = v;
+            if (v > max_v) max_v = v;
+          }
+        }
+        int32_t span = max_v - min_v + 1;
+        int32_t distinct = 0;
+        for (int32_t v = min_v; v <= max_v; ++v) {
+          if (present[v]) distinct++;
+        }
+        // Matches default channel_colors_percent (80%) and nb_pixels / 16 cap.
+        if (distinct > 1 && distinct * 5 <= span * 4 &&
+            static_cast<size_t>(distinct) <= (tw * th) / 16) {
+          use_compact = true;
+          int32_t idx = 0;
+          int32_t prev_v = 0;
+          for (int32_t v = min_v; v <= max_v; ++v) {
+            if (present[v]) {
+              local_pos[v] = idx++;
+              int32_t gap = (idx == 1) ? v : (v - prev_v);
+              compact_pal_bits +=
+                  std::log2(static_cast<double>(gap) + 1.0) + 1.0;
+              prev_v = v;
+            }
+          }
+        }
+      }
+
+      for (size_t y = y0; y < y1; y += y_step) {
+        const uint16_t* row = &idx_img[y * w];
+        const uint16_t* prev_row = (y > y0) ? &idx_img[(y - 1) * w] : nullptr;
+        int32_t left = 0;
+        int32_t topleft = 0;
+        uint32_t zero_run = 0;
+        size_t run_ctx = 0;
+        for (size_t x = x0; x < x1; ++x) {
+          uint16_t raw = row[x];
+          int32_t cur = (raw < n) ? pos[raw] : implicit_idx;
+          if (use_compact) cur = local_pos[cur];
+          int32_t top;
+          if (prev_row) {
+            uint16_t raw_top = prev_row[x];
+            top = (raw_top < n) ? pos[raw_top] : implicit_idx;
+            if (use_compact) top = local_pos[top];
+          } else {
+            top = left;
+          }
+          if (lz_mask[y * w + x]) {
+            flush_zero_run(zero_run, run_ctx);
+            topleft = top;
+            left = cur;
+            continue;
+          }
+          int32_t guess = (x == x0 && y == y0) ? 0
+                          : (y == y0)          ? left
+                          : (x == x0) ? top
+                                      : ClampedGradient(top, left, topleft);
+          uint32_t grad = static_cast<uint32_t>(std::abs(left - topleft) +
+                                                std::abs(top - topleft));
+          size_t ctx =
+              (grad == 0)
+                  ? 0
+                  : std::min<size_t>(kNumCtx - 1, 1 + FloorLog2Nonzero(grad));
+          int32_t res = cur - guess;
+          if (res == 0) {
+            if (zero_run == 0) run_ctx = ctx;
+            zero_run++;
+          } else {
+            flush_zero_run(zero_run, run_ctx);
+            push_token(ctx, res);
+          }
+          topleft = top;
+          left = cur;
+        }
+        flush_zero_run(zero_run, run_ctx);
+      }
+    }
+  }
+
+  double img_bits = extra_bits;
+  for (size_t c = 0; c < kNumCtx; ++c) {
+    if (ctx_totals[c] == 0) continue;
+    double inv_total = 1.0 / static_cast<double>(ctx_totals[c]);
+    for (size_t t = 0; t < kMaxTokens; ++t) {
+      if (counts[c][t] > 0) {
+        double p = static_cast<double>(counts[c][t]) * inv_total;
+        img_bits -= static_cast<double>(counts[c][t]) * std::log2(p);
+      }
+    }
+  }
+  img_bits = img_bits * static_cast<double>(y_step) + compact_pal_bits;
+
+  // Add approximate bit cost of storing the palette meta-channel itself
+  // (2D ClampedGradient over nb x n, matching modular meta-channel encoding).
+  uint64_t pal_counts[kMaxTokens] = {};
+  uint64_t pal_total = 0;
+  double pal_extra = 0.0;
+  for (size_t c = 0; c < nb; ++c) {
+    int32_t left = 0;
+    int32_t topleft = 0;
+    for (size_t i = 0; i < n; ++i) {
+      int32_t cur = palette[remapping[i]][c];
+      int32_t top = (c > 0) ? palette[remapping[i]][c - 1] : left;
+      int32_t guess = (i == 0 && c == 0) ? 0
+                      : (c == 0)         ? left
+                      : (i == 0)         ? top
+                                         : ClampedGradient(top, left, topleft);
+      int32_t res = cur - guess;
+      uint32_t v =
+          static_cast<uint32_t>(res >= 0 ? (res << 1) : ((-res << 1) - 1));
+      uint32_t tok;
+      if (v < 16) {
+        tok = v;
+      } else {
+        uint32_t nbits = FloorLog2Nonzero(v);
+        tok = 16 + ((nbits - 4) << 1) + ((v >> (nbits - 1)) & 1);
+        if (tok >= kMaxTokens) tok = kMaxTokens - 1;
+        pal_extra += static_cast<double>(nbits - 1);
+      }
+      pal_counts[tok]++;
+      pal_total++;
+      topleft = top;
+      left = cur;
+    }
+  }
+  double pal_bits = pal_extra;
+  if (pal_total > 0) {
+    double inv_total = 1.0 / static_cast<double>(pal_total);
+    for (size_t t = 0; t < kMaxTokens; ++t) {
+      if (pal_counts[t] > 0) {
+        double p = static_cast<double>(pal_counts[t]) * inv_total;
+        pal_bits -= static_cast<double>(pal_counts[t]) * std::log2(p);
+      }
+    }
+  }
+  return img_bits + pal_bits;
 }
 
 bool PaletteHasNonMonotonousDeltas(
@@ -812,24 +1112,12 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
       }
     } else {
       size_t num_colors = candidate_palette_imageorder.size();
-      size_t num_common = 0;
-      for (size_t i = 0; i < num_colors; ++i) {
-        auto it = color_freq_map.find(candidate_palette_imageorder[i]);
-        if (it != color_freq_map.end() && it->second > 4) num_common++;
-      }
-      size_t num_rare = num_colors - num_common;
-
-      // For images dominated by rare anti-aliasing / gradient colors (e.g.
-      // radiation.png, image-subsampling-test.png), partitioning common colors
-      // and ordering by luma allows subsequent group channel compaction to
-      // succeed and optimizes gradient prediction. Otherwise (e.g. distinct
-      // illustrations like hero1.png, icons, pixel art), EZeng + PairwiseSwap
-      // directly optimizes linear arrangement across color boundaries.
       FastColorMap color_map;
       color_map.Init(candidate_palette_imageorder);
 
       std::vector<std::vector<uint32_t>> matrix(
           num_colors, std::vector<uint32_t>(num_colors, 0));
+      std::vector<uint16_t> idx_img(w * h, 0xFFFF);
       std::vector<int> prev_row(w, -1);
 
       for (size_t y = 0; y < h; y++) {
@@ -837,12 +1125,14 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
           p_in[c] = input.channel[begin_c + c].Row(y);
         }
         int prev_val = -1;
+        uint16_t* idx_row = &idx_img[y * w];
         for (size_t x = 0; x < w; x++) {
           for (uint32_t c = 0; c < nb; c++) {
             color[c] = p_in[c][x];
           }
           int val = color_map.Find(color);
           if (val != -1) {
+            idx_row[x] = static_cast<uint16_t>(val);
             if (prev_val != -1) {
               matrix[prev_val][val]++;
             }
@@ -865,74 +1155,113 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
         }
       }
 
-      uint64_t total_trans = 0;
-      uint64_t high_contrast_trans = 0;
-      for (size_t i = 0; i < num_colors; i++) {
-        float y1 = 0.299f * candidate_palette_imageorder[i][0] +
-                   0.587f * candidate_palette_imageorder[i][1] +
-                   0.114f * candidate_palette_imageorder[i][2];
-        for (size_t j = i + 1; j < num_colors; j++) {
-          if (matrix[i][j] > 0) {
-            total_trans += matrix[i][j];
-            float y2 = 0.299f * candidate_palette_imageorder[j][0] +
-                       0.587f * candidate_palette_imageorder[j][1] +
-                       0.114f * candidate_palette_imageorder[j][2];
-            if (std::abs(y1 - y2) > 100.0f) {
-              high_contrast_trans += matrix[i][j];
-            }
-          }
-        }
+      // Candidate 1: Luma order (partitioned into common vs rare colors).
+      std::vector<size_t> remapping_luma(num_colors);
+      std::vector<size_t> freqs(num_colors, 0);
+      for (size_t i = 0; i < num_colors; ++i) {
+        remapping_luma[i] = i;
+        auto it = color_freq_map.find(candidate_palette_imageorder[i]);
+        if (it != color_freq_map.end()) freqs[i] = it->second;
       }
-
-      bool use_luma = false;
-      if (w > 256 || h > 256) {
-        use_luma = (num_rare > num_common);
-      } else {
-        use_luma = (num_rare > num_common) &&
-                   (high_contrast_trans * 5 <= total_trans * 2);
-      }
-
-      if (use_luma) {
-        JXL_DEBUG_V(7, "Palette of %i colors, using luma order", nb_colors);
+      if (nb >= 3) {
         std::sort(
-            candidate_palette_imageorder.begin(),
-            candidate_palette_imageorder.end(),
-            [&](const std::vector<pixel_type>& ap,
-                const std::vector<pixel_type>& bp) {
+            remapping_luma.begin(), remapping_luma.end(),
+            [&](size_t ai, size_t bi) {
+              const auto& ap = candidate_palette_imageorder[ai];
+              const auto& bp = candidate_palette_imageorder[bi];
               float ay =
                   (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
               if (ap.size() > 3) ay *= 1.f + ap[3];
               float by =
                   (0.299f * bp[0] + 0.587f * bp[1] + 0.114f * bp[2] + 0.1f);
               if (bp.size() > 3) by *= 1.f + bp[3];
-              size_t fa = 0, fb = 0;
-              auto ita = color_freq_map.find(ap);
-              if (ita != color_freq_map.end()) fa = ita->second;
-              auto itb = color_freq_map.find(bp);
-              if (itb != color_freq_map.end()) fb = itb->second;
-              ay = fa > 4 ? -ay : ay;
-              by = fb > 4 ? -by : by;
+              ay = freqs[ai] > 4 ? -ay : ay;
+              by = freqs[bi] > 4 ? -by : by;
               if (std::abs(ay - by) > 1e-4f) return ay < by;
               float acb = -0.1687f * ap[0] - 0.3313f * ap[1] + 0.5f * ap[2];
               float bcb = -0.1687f * bp[0] - 0.3313f * bp[1] + 0.5f * bp[2];
               return acb < bcb;
             });
-      } else {
-        JXL_DEBUG_V(7, "Palette of %i colors, using ezeng order", nb_colors);
-
-        AdjList adj = BuildAdjList(matrix);
-        std::vector<size_t> remapping = EZengReindex(matrix);
-        PairwiseSwapSearch(remapping, adj, 50);
-        TwoOptSearch(remapping, adj);
-        OrientRemapping(remapping, candidate_palette_imageorder,
-                        color_freq_map);
-
-        std::vector<std::vector<pixel_type>> new_order(num_colors);
-        for (size_t i = 0; i < num_colors; ++i) {
-          new_order[i] = candidate_palette_imageorder[remapping[i]];
-        }
-        candidate_palette_imageorder = std::move(new_order);
       }
+
+      // Candidate 2: WebP MinimizeDeltas (greedy nearest-neighbor RGB L1).
+      std::vector<size_t> remapping_delta(num_colors);
+      for (size_t i = 0; i < num_colors; ++i) remapping_delta[i] = i;
+      std::sort(remapping_delta.begin(), remapping_delta.end(),
+                [&](size_t ai, size_t bi) {
+                  return candidate_palette_imageorder[ai] <
+                         candidate_palette_imageorder[bi];
+                });
+      auto rgb_dist_idx = [&](size_t ai, size_t bi) -> int64_t {
+        const auto& a = candidate_palette_imageorder[ai];
+        const auto& b = candidate_palette_imageorder[bi];
+        int64_t d = 0;
+        for (size_t c = 0; c < nb; ++c) {
+          d +=
+              std::abs(static_cast<int64_t>(a[c]) - static_cast<int64_t>(b[c]));
+        }
+        return d;
+      };
+      for (size_t i = 1; i < num_colors; ++i) {
+        size_t best_ix = i;
+        int64_t best_score = std::numeric_limits<int64_t>::max();
+        size_t prev = remapping_delta[i - 1];
+        for (size_t k = i; k < num_colors; ++k) {
+          int64_t score = rgb_dist_idx(prev, remapping_delta[k]);
+          if (score < best_score) {
+            best_score = score;
+            best_ix = k;
+          }
+        }
+        if (best_ix != i) {
+          size_t chosen = remapping_delta[best_ix];
+          for (size_t k = best_ix; k > i; --k) {
+            remapping_delta[k] = remapping_delta[k - 1];
+          }
+          remapping_delta[i] = chosen;
+        }
+      }
+      OrientRemapping(remapping_delta, candidate_palette_imageorder,
+                      color_freq_map);
+
+      // Candidate 3: EZeng + PairwiseSwap + TwoOpt on co-occurrence graph.
+      AdjList adj = BuildAdjList(matrix);
+      std::vector<size_t> remapping_ezeng = EZengReindex(matrix);
+      PairwiseSwapSearch(remapping_ezeng, adj, 50);
+      TwoOptSearch(remapping_ezeng, adj);
+      OrientRemapping(remapping_ezeng, candidate_palette_imageorder,
+                      color_freq_map);
+
+      // Pick the ordering with the lowest estimated modular bit cost
+      // (2D LZ77-masked, per-group ChannelCompact-aware ClampedGradient
+      // entropy + 2D palette meta-channel entropy).
+      std::vector<uint8_t> lz_mask = ComputeLZ77MatchMask(idx_img, w, h);
+      double cost_luma = EvaluatePaletteOrderCost(idx_img, lz_mask, w, h,
+                                                  candidate_palette_imageorder,
+                                                  remapping_luma, nb);
+      double cost_delta = EvaluatePaletteOrderCost(idx_img, lz_mask, w, h,
+                                                   candidate_palette_imageorder,
+                                                   remapping_delta, nb);
+      double cost_ezeng = EvaluatePaletteOrderCost(idx_img, lz_mask, w, h,
+                                                   candidate_palette_imageorder,
+                                                   remapping_ezeng, nb);
+
+      const std::vector<size_t>* best_remapping = &remapping_ezeng;
+      double best_cost = cost_ezeng;
+      if (cost_luma < best_cost) {
+        best_cost = cost_luma;
+        best_remapping = &remapping_luma;
+      }
+      if (cost_delta < best_cost) {
+        best_cost = cost_delta;
+        best_remapping = &remapping_delta;
+      }
+
+      std::vector<std::vector<pixel_type>> new_order(num_colors);
+      for (size_t i = 0; i < num_colors; ++i) {
+        new_order[i] = candidate_palette_imageorder[(*best_remapping)[i]];
+      }
+      candidate_palette_imageorder = std::move(new_order);
     }
   } else {
     JXL_DEBUG_V(7, "Palette of %i colors, using image order", nb_colors);
