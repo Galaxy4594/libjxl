@@ -1066,19 +1066,6 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
           std::reverse(candidate_palette_imageorder.begin(),
                        candidate_palette_imageorder.end());
         }
-        const size_t dom_thresh = (w * h > 65536) ? 64 : (w * h) / 4;
-        std::stable_sort(candidate_palette_imageorder.begin(),
-                         candidate_palette_imageorder.end(),
-                         [&](const std::vector<pixel_type>& a,
-                             const std::vector<pixel_type>& b) {
-                           size_t fa = color_freq_map[a];
-                           size_t fb = color_freq_map[b];
-                           bool dom_a = (fa >= dom_thresh);
-                           bool dom_b = (fb >= dom_thresh);
-                           if (dom_a != dom_b) return dom_a > dom_b;
-                           if (dom_a && dom_b) return fa > fb;
-                           return false;
-                         });
       } else if (!zero_predictor_mode &&
                  (n_pal <= 1024 || palette_effort >= 1) &&
                  PaletteHasNonMonotonousDeltas(candidate_palette_imageorder,
@@ -1112,7 +1099,7 @@ Status FwdPaletteIteration(Image& input, uint32_t begin_c, uint32_t end_c,
             candidate_palette_imageorder[i] = std::move(chosen);
           }
         }
-        if (n_pal > 2) {
+        if (n_pal <= 1024 && n_pal > 2) {
           size_t f_front = color_freq_map[candidate_palette_imageorder.front()];
           size_t f_back = color_freq_map[candidate_palette_imageorder.back()];
           if (f_back > f_front) {
