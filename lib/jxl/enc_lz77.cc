@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <unordered_map>
 #include <vector>
 
 #include "lib/jxl/ans_params.h"
@@ -179,14 +178,13 @@ std::vector<std::vector<Token>> ApplyLZ77_RLE(
   return {};
 }
 
-
 // Computes a Murmur-style mix hash over HashSize elements.
-template <int kHashSize=3>
+template <int kHashSize = 3>
 uint32_t GetHash(size_t pos, const std::vector<uint32_t>& data_) {
   uint32_t h = 0;
   if (pos + kHashSize <= data_.size()) {
     for (size_t i = 0; i < kHashSize; i++) {
-      h ^= data_[pos+i] + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= data_[pos + i] + 0x9e3779b9 + (h << 6) + (h >> 2);
     }
     h ^= h >> 16;
     h *= 0x85ebca6bu;
@@ -225,8 +223,13 @@ struct HashChain {
   size_t min_length_;
   size_t max_length_;
 
-  // Map of special distance codes.
-  std::unordered_map<int, int> special_dist_table_;
+  // Flat lookup table and list of special 2D distance codes.
+  std::vector<int8_t> special_dist_table_;
+  struct PrecomputedSpecialDist {
+    uint32_t dist;
+    uint8_t symbol;
+  };
+  std::vector<PrecomputedSpecialDist> special_dists_;
   size_t num_special_distances_ = 0;
 
   uint32_t maxchainlength = kMaxChainLength;  // window_size_ to allow all
@@ -258,15 +261,39 @@ struct HashChain {
     }
     // Translate distance to special distance code.
     if (distance_multiplier) {
+      special_dist_table_.assign(distance_multiplier * 8 + 8, -1);
       // Count down, so if due to small distance multiplier multiple distances
       // map to the same code, the smallest code will be used in the end.
       for (int i = kNumSpecialDistances - 1; i >= 0; --i) {
-        special_dist_table_[SpecialDistance(i, distance_multiplier)] = i;
+        int dist = SpecialDistance(i, distance_multiplier);
+        if (dist >= 0 &&
+            static_cast<size_t>(dist) < special_dist_table_.size()) {
+          special_dist_table_[dist] = static_cast<int8_t>(i);
+        }
+      }
+      // Precompute the top 24 special 2D distances for direct checking when
+      // hash chains overflow.
+      constexpr size_t kCheckSpecial = 24;
+      size_t n_spec = std::min(kCheckSpecial, kNumSpecialDistances);
+      special_dists_.reserve(n_spec);
+      for (size_t i = 0; i < n_spec; ++i) {
+        int dist = SpecialDistance(i, distance_multiplier);
+        if (dist > 0 && static_cast<size_t>(dist) <= kWindowSize) {
+          special_dists_.push_back(
+              {static_cast<uint32_t>(dist), static_cast<uint8_t>(i)});
+        }
       }
       num_special_distances_ = kNumSpecialDistances;
     }
   }
 
+  inline int DistToSymbol(int dist) const {
+    if (static_cast<size_t>(dist) < special_dist_table_.size()) {
+      int8_t s = special_dist_table_[dist];
+      if (s >= 0) return s;
+    }
+    return static_cast<int>(num_special_distances_) + dist - 1;
+  }
 
   uint32_t CountZeros(size_t pos, uint32_t prevzeros) const {
     size_t end = pos + window_size_;
@@ -341,17 +368,41 @@ struct HashChain {
         // best length, because it is possible for a slightly cheaper distance
         // symbol to occur.
         if (len >= min_length_ && len + 2 >= best_len) {
-          auto it = special_dist_table_.find(dist);
-          int dist_symbol = (it == special_dist_table_.end())
-                                ? (num_special_distances_ + dist - 1)
-                                : it->second;
-          found_match(len, dist_symbol);
+          found_match(len, DistToSymbol(dist));
           if (len > best_len) best_len = len;
         }
       }
 
       chainlength++;
-      if (chainlength >= maxchainlength) break;
+      if (chainlength >= maxchainlength) {
+        // When the hash chain hits its limit, still check top special 2D
+        // distances (e.g. 1-2 rows up) that may have been pushed past
+        // maxchainlength in hot buckets.
+        for (const auto& sd : special_dists_) {
+          int d = static_cast<int>(sd.dist);
+          if (d <= prev_dist || d > max_dist || static_cast<size_t>(d) > pos) {
+            continue;
+          }
+          int i = pos;
+          int j = pos - d;
+          if (i + static_cast<int>(min_length_) > end) continue;
+          if (data_[i] != data_[j] || data_[i + 1] != data_[j + 1] ||
+              data_[i + 2] != data_[j + 2]) {
+            continue;
+          }
+          i += 3;
+          j += 3;
+          while (i < end && data_[i] == data_[j]) {
+            i++;
+            j++;
+          }
+          uint32_t slen = i - pos;
+          if (slen >= min_length_) {
+            found_match(slen, sd.symbol);
+          }
+        }
+        break;
+      }
 
       if (numzeros >= 3 && len > numzeros) {
         if (hashpos == chainz[hashpos]) break;
@@ -456,164 +507,175 @@ float DistCost(size_t dist) {
   return kCostTable[tok] + nbits;
 }
 
-
 // Fast hash map for LZ77 compression using a fixed-size ring buffer per bucket.
 // Overwrites the oldest candidates when a bucket reaches max capacity.
 // For optimal performance kBucketSize should be a power of 2 minus 1
 template <uint16_t kBucketSize, int kHashSize,
           size_t kSpecialDistancesToCheck = (kBucketSize <= 3 ? 24 : 120)>
 class LZ77HashMap {
-public:
-    // Initializes the hash map mask, table size, and distance lookup table.
-    explicit LZ77HashMap(const std::vector<uint32_t>& data,
-                        size_t distance_multiplier, uint32_t hash_bits = 14)
-        : data_(data),
-          hash_mask_((uint32_t{1} << hash_bits) - 1),
-          hash_table_(static_cast<size_t>(hash_mask_) + 1) {
-        num_special_distances_ = 0;
-        if (distance_multiplier) {
-            num_special_distances_ = kNumSpecialDistances;
-            special_dist_table_.assign(distance_multiplier * 8 + 8, -1);
-            for (int i = static_cast<int>(kNumSpecialDistances) - 1; i >= 0; --i) {
-                int dist = SpecialDistance(i, distance_multiplier);
-                if (dist >= 0 && static_cast<size_t>(dist) < special_dist_table_.size()) {
-                    special_dist_table_[dist] = i;
-                }
-            }
-            if (kSpecialDistancesToCheck > 0) {
-                size_t n = std::min(kSpecialDistancesToCheck, kNumSpecialDistances);
-                special_dists_.reserve(n);
-                for (size_t i = 0; i < n; ++i) {
-                    int dist = SpecialDistance(i, distance_multiplier);
-                    if (dist > 0 && static_cast<size_t>(dist) <= kWindowSize) {
-                        special_dists_.push_back({static_cast<uint32_t>(dist), static_cast<uint8_t>(i)});
-                    }
-                }
-            }
+ public:
+  // Initializes the hash map mask, table size, and distance lookup table.
+  explicit LZ77HashMap(const std::vector<uint32_t>& data,
+                       size_t distance_multiplier, uint32_t hash_bits = 14)
+      : data_(data),
+        hash_mask_((uint32_t{1} << hash_bits) - 1),
+        hash_table_(static_cast<size_t>(hash_mask_) + 1) {
+    num_special_distances_ = 0;
+    if (distance_multiplier) {
+      num_special_distances_ = kNumSpecialDistances;
+      special_dist_table_.assign(distance_multiplier * 8 + 8, -1);
+      for (int i = static_cast<int>(kNumSpecialDistances) - 1; i >= 0; --i) {
+        int dist = SpecialDistance(i, distance_multiplier);
+        if (dist >= 0 &&
+            static_cast<size_t>(dist) < special_dist_table_.size()) {
+          special_dist_table_[dist] = i;
         }
+      }
+      if (kSpecialDistancesToCheck > 0) {
+        size_t n = std::min(kSpecialDistancesToCheck, kNumSpecialDistances);
+        special_dists_.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+          int dist = SpecialDistance(i, distance_multiplier);
+          if (dist > 0 && static_cast<size_t>(dist) <= kWindowSize) {
+            special_dists_.push_back(
+                {static_cast<uint32_t>(dist), static_cast<uint8_t>(i)});
+          }
+        }
+      }
+    }
+  }
+
+  // Searches for the longest matching sequence in the bucket for 'pos'.
+  // Updates length and dist_symbol with the best match found, then inserts
+  // 'pos'.
+  void FindMatch(size_t pos, size_t& len, size_t& dist_symbol, size_t min_len) {
+    const uint32_t h = GetHash<kHashSize>(pos, data_) & hash_mask_;
+    len = 0;
+    dist_symbol = 0;
+
+    // If the bucket is full, entries older than oldest_pos were evicted.
+    // Candidates with dist <= max_safe_dist are guaranteed to still be present
+    // in the bucket (if they match the 3-token hash), so we only need to test
+    // special distances where dist > max_safe_dist. If the bucket is not full,
+    // no entry has ever been evicted, so we can skip entirely.
+    if (hash_table_[h].size == kBucketSize) {
+      const uint32_t oldest_pos = hash_table_[h].data[hash_table_[h].idx];
+      const size_t max_safe_dist = pos - oldest_pos;
+      for (const auto& sd : special_dists_) {
+        if (sd.dist <= max_safe_dist || sd.dist > pos) continue;
+        const size_t req_len =
+            len == 0 ? min_len : (sd.symbol < dist_symbol ? len : len + 1);
+        if (pos + req_len > data_.size()) continue;
+        const size_t candidate = pos - sd.dist;
+        if (data_[candidate + req_len - 1] != data_[pos + req_len - 1] ||
+            data_[candidate] != data_[pos]) {
+          continue;
+        }
+        size_t cur_length = MatchLength(candidate, pos);
+        if (cur_length < req_len) {
+          continue;
+        }
+        len = cur_length;
+        dist_symbol = sd.symbol;
+      }
     }
 
-    // Searches for the longest matching sequence in the bucket for 'pos'.
-    // Updates length and dist_symbol with the best match found, then inserts 'pos'.
-    void FindMatch(size_t pos, size_t& len, size_t& dist_symbol, size_t min_len) {
-        const uint32_t h = GetHash<kHashSize>(pos, data_) & hash_mask_;
-        len = 0;
-        dist_symbol = 0;
+    // Scan all existing entries in the bucket
+    for (uint16_t i = 0; i < hash_table_[h].size; i++) {
+      const uint32_t candidate = hash_table_[h].data[i];
+      size_t dist = pos - candidate;
+      if (dist > kWindowSize) {
+        continue;
+      }
 
-        // If the bucket is full, entries older than oldest_pos were evicted.
-        // Candidates with dist <= max_safe_dist are guaranteed to still be present in
-        // the bucket (if they match the 3-token hash), so we only need to test special
-        // distances where dist > max_safe_dist.
-        // If the bucket is not full, no entry has ever been evicted, so we can skip entirely.
-        if (hash_table_[h].size == kBucketSize) {
-            const uint32_t oldest_pos = hash_table_[h].data[hash_table_[h].idx];
-            const size_t max_safe_dist = pos - oldest_pos;
-            for (const auto& sd : special_dists_) {
-                if (sd.dist <= max_safe_dist || sd.dist > pos) continue;
-                const size_t req_len =
-                    len == 0 ? min_len : (sd.symbol < dist_symbol ? len : len + 1);
-                if (pos + req_len > data_.size()) continue;
-                const size_t candidate = pos - sd.dist;
-                if (data_[candidate + req_len - 1] != data_[pos + req_len - 1] ||
-                    data_[candidate] != data_[pos]) {
-                    continue;
-                }
-                size_t cur_length = MatchLength(candidate, pos);
-                if (cur_length < req_len) {
-                    continue;
-                }
-                len = cur_length;
-                dist_symbol = sd.symbol;
-            }
+      // Map distance to a symbol encoding (prefers special distance codes if
+      // available)
+      size_t cur_dist_symbol = (num_special_distances_ + dist - 1);
+      if (dist < special_dist_table_.size()) {
+        int lookup = special_dist_table_[dist];
+        if (lookup >= 0) {
+          cur_dist_symbol = lookup;
         }
+      }
 
-        // Scan all existing entries in the bucket
-        for (uint16_t i = 0; i < hash_table_[h].size; i++) {
-            const uint32_t candidate = hash_table_[h].data[i];
-            size_t dist = pos - candidate;
-            if (dist > kWindowSize) {
-                continue;
-            }
+      // Reject if candidate cannot beat current best (len, dist_symbol)
+      const size_t req_len =
+          len == 0 ? min_len : (cur_dist_symbol < dist_symbol ? len : len + 1);
+      if (pos + req_len > data_.size() ||
+          data_[candidate + req_len - 1] != data_[pos + req_len - 1]) {
+        continue;
+      }
 
-            // Map distance to a symbol encoding (prefers special distance codes if available)
-            size_t cur_dist_symbol = (num_special_distances_ + dist - 1);
-            if (dist < special_dist_table_.size()) {
-                int lookup = special_dist_table_[dist];
-                if (lookup >= 0) {
-                    cur_dist_symbol = lookup;
-                }
-            }
+      size_t cur_length = MatchLength(candidate, pos);
+      if (cur_length < req_len) {
+        continue;
+      }
 
-            // Reject if candidate cannot beat current best (len, dist_symbol)
-            const size_t req_len =
-                len == 0 ? min_len : (cur_dist_symbol < dist_symbol ? len : len + 1);
-            if (pos + req_len > data_.size() ||
-                data_[candidate + req_len - 1] != data_[pos + req_len - 1]) {
-                continue;
-            }
-
-            size_t cur_length = MatchLength(candidate, pos);
-            if (cur_length < req_len) {
-                continue;
-            }
-
-            len = cur_length;
-            dist_symbol = cur_dist_symbol;
-        }
-
-        // Insert 'pos' into the bucket ring buffer
-        hash_table_[h].size = std::min(static_cast<uint16_t>(hash_table_[h].size + 1), kBucketSize);
-        hash_table_[h].data[hash_table_[h].idx] = static_cast<uint32_t>(pos);
-        hash_table_[h].idx = hash_table_[h].idx + 1 - static_cast<uint16_t>(hash_table_[h].idx + 1 >= kBucketSize) * kBucketSize;
+      len = cur_length;
+      dist_symbol = cur_dist_symbol;
     }
 
-    // Inserts 'pos' into its bucket without performing a match search.
-    void Update(size_t pos) {
-        const uint32_t h = GetHash<kHashSize>(pos, data_) & hash_mask_;
-        hash_table_[h].size = std::min(static_cast<uint16_t>(hash_table_[h].size + 1), kBucketSize);
-        hash_table_[h].data[hash_table_[h].idx] = static_cast<uint32_t>(pos);
-        hash_table_[h].idx = hash_table_[h].idx + 1 - static_cast<uint16_t>(hash_table_[h].idx + 1 >= kBucketSize) * kBucketSize;
+    // Insert 'pos' into the bucket ring buffer
+    hash_table_[h].size =
+        std::min(static_cast<uint16_t>(hash_table_[h].size + 1), kBucketSize);
+    hash_table_[h].data[hash_table_[h].idx] = static_cast<uint32_t>(pos);
+    hash_table_[h].idx =
+        hash_table_[h].idx + 1 -
+        static_cast<uint16_t>(hash_table_[h].idx + 1 >= kBucketSize) *
+            kBucketSize;
+  }
+
+  // Inserts 'pos' into its bucket without performing a match search.
+  void Update(size_t pos) {
+    const uint32_t h = GetHash<kHashSize>(pos, data_) & hash_mask_;
+    hash_table_[h].size =
+        std::min(static_cast<uint16_t>(hash_table_[h].size + 1), kBucketSize);
+    hash_table_[h].data[hash_table_[h].idx] = static_cast<uint32_t>(pos);
+    hash_table_[h].idx =
+        hash_table_[h].idx + 1 -
+        static_cast<uint16_t>(hash_table_[h].idx + 1 >= kBucketSize) *
+            kBucketSize;
+  }
+
+ private:
+  // Fixed-capacity bucket stored as a ring buffer.
+  struct HashBucket {
+    std::array<uint32_t, kBucketSize> data;
+    uint16_t idx = 0;   // Insertion index
+    uint16_t size = 0;  // Current entry count (<= kBucketSize)
+  };
+
+  // Measures matching prefix length between indices 'a' and 'b'.
+  size_t MatchLength(size_t a, size_t b) const {
+    JXL_DASSERT(a < b);
+    size_t len = 0;
+    while (b + len < data_.size() && data_[a + len] == data_[b + len]) {
+      ++len;
     }
+    return len;
+  }
 
-private:
-    // Fixed-capacity bucket stored as a ring buffer.
-    struct HashBucket {
-        std::array<uint32_t, kBucketSize> data;
-        uint16_t idx = 0;   // Insertion index
-        uint16_t size = 0;  // Current entry count (<= kBucketSize)
-    };
+  struct PrecomputedSpecialDist {
+    uint32_t dist;
+    uint8_t symbol;
+  };
 
-    // Measures matching prefix length between indices 'a' and 'b'.
-    size_t MatchLength(size_t a, size_t b) const {
-        JXL_DASSERT(a < b);
-        size_t len = 0;
-        while (b + len < data_.size() && data_[a + len] == data_[b + len]) {
-            ++len;
-        }
-        return len;
-    }
-
-    struct PrecomputedSpecialDist {
-        uint32_t dist;
-        uint8_t symbol;
-    };
-
-    const std::vector<uint32_t>& data_;
-    uint32_t hash_mask_;
-    std::vector<HashBucket> hash_table_;
-    std::vector<int8_t> special_dist_table_;
-    std::vector<PrecomputedSpecialDist> special_dists_;
-    size_t num_special_distances_;
+  const std::vector<uint32_t>& data_;
+  uint32_t hash_mask_;
+  std::vector<HashBucket> hash_table_;
+  std::vector<int8_t> special_dist_table_;
+  std::vector<PrecomputedSpecialDist> special_dists_;
+  size_t num_special_distances_;
 };
 
-
-// Fast LZ77 compression on streams of tokens using cost-based matching decision.
-// Returns the compressed token streams if savings exceed the threshold.
-template<int kBucketSize = 7, int kHashSize = 3, bool kRuntimeCostComparison = true>
+// Fast LZ77 compression on streams of tokens using cost-based matching
+// decision. Returns the compressed token streams if savings exceed the
+// threshold.
+template <int kBucketSize = 7, int kHashSize = 3,
+          bool kRuntimeCostComparison = true>
 std::vector<std::vector<Token>> ApplyLZ77_LZ77(
     const HistogramParams& params, size_t num_contexts,
-    const std::vector<std::vector<Token>>& tokens, const LZ77Params& lz77
-) {
+    const std::vector<std::vector<Token>>& tokens, const LZ77Params& lz77) {
   std::vector<std::vector<Token>> tokens_lz77(tokens.size());
   SymbolCostEstimator sce(num_contexts, params.force_huffman, tokens, lz77,
                           params.UintConfig());
@@ -638,7 +700,8 @@ std::vector<std::vector<Token>> ApplyLZ77_LZ77(
     for (size_t pos = 0; pos < in.size(); pos++) {
       uint32_t tok, nbits, unused_bits;
       uint_config.Encode(in[pos].value, &tok, &nbits, &unused_bits);
-      sym_cost[pos + 1] = sce.Bits(in[pos].context, tok) + nbits + sym_cost[pos];
+      sym_cost[pos + 1] =
+          sce.Bits(in[pos].context, tok) + nbits + sym_cost[pos];
       data[pos] = in[pos].value;
     }
     total_raw_cost += sym_cost[in.size()];
@@ -721,141 +784,167 @@ std::vector<std::vector<Token>> ApplyLZ77_Optimal(
   // If greedy-LZ77 does not give better compression than no-lz77, no reason to
   // run the optimal matching.
   if (tokens_for_cost_estimate.empty()) return {};
-  SymbolCostEstimator sce(num_contexts + 1, params.force_huffman,
-                          tokens_for_cost_estimate, lz77, params.UintConfig());
-  std::vector<std::vector<Token>> tokens_lz77(tokens.size());
   HybridUintConfig uint_config = params.UintConfig();
+
+  // For high-effort optimal parsing (kOptc256), run 2 Zopfli-style DP passes:
+  // pass 0 uses the greedy parse's symbol costs, pass 1 re-estimates literal,
+  // length, and distance costs from pass 0's optimal parse.
+  constexpr int kNumPasses = (kMaxChainLength >= 64) ? 2 : 1;
+  std::vector<std::vector<Token>> tokens_lz77(tokens.size());
   std::vector<float> sym_cost;
   std::vector<uint32_t> dist_symbols;
-  for (size_t stream = 0; stream < tokens.size(); stream++) {
-    size_t distance_multiplier =
-        params.image_widths.size() > stream ? params.image_widths[stream] : 0;
-    const auto& in = tokens[stream];
-    auto& out = tokens_lz77[stream];
-    if (in.empty()) continue;
-    // Cumulative sum of bit costs.
-    sym_cost.resize(in.size() + 1);
-    for (size_t i = 0; i < in.size(); i++) {
-      uint32_t tok, nbits, unused_bits;
-      uint_config.Encode(in[i].value, &tok, &nbits, &unused_bits);
-      sym_cost[i + 1] = sce.Bits(in[i].context, tok) + nbits + sym_cost[i];
-    }
+  std::vector<float> dist_costs;
 
-    out.reserve(in.size());
-    size_t max_distance = std::min(in.size(), kWindowSize);
-    size_t min_length = lz77.min_length;
-    JXL_DASSERT(min_length >= 3);
-    size_t max_length = in.size();
-
-    // Use next power of two as window size.
-    size_t window_size = 1;
-    while (window_size < max_distance && window_size < kWindowSize) {
-      window_size <<= 1;
-    }
-
-    HashChain<kMaxChainLength> chain(in.data(), in.size(), window_size, min_length, max_length,
-                    distance_multiplier);
-
-    struct MatchInfo {
-      uint32_t len;
-      uint32_t dist_symbol;
-      uint32_t ctx;
-      float total_cost = std::numeric_limits<float>::max();
-    };
-    // Total cost to encode the first N symbols.
-    std::vector<MatchInfo> prefix_costs(in.size() + 1);
-    prefix_costs[0].total_cost = 0;
-
-    size_t rle_length = 0;
-    size_t skip_lz77 = 0;
-    size_t prev_match_end = 0;
-    size_t prev_match_dist = 0;
-    for (size_t i = 0; i < in.size(); i++) {
-      chain.Update(i);
-      float lit_cost =
-          prefix_costs[i].total_cost + sym_cost[i + 1] - sym_cost[i];
-      if (prefix_costs[i + 1].total_cost > lit_cost) {
-        prefix_costs[i + 1].dist_symbol = 0;
-        prefix_costs[i + 1].len = 1;
-        prefix_costs[i + 1].ctx = in[i].context;
-        prefix_costs[i + 1].total_cost = lit_cost;
+  for (int pass = 0; pass < kNumPasses; ++pass) {
+    const auto& cost_source =
+        (pass == 0) ? tokens_for_cost_estimate : tokens_lz77;
+    SymbolCostEstimator sce(num_contexts + 1, params.force_huffman, cost_source,
+                            lz77, uint_config);
+    std::vector<std::vector<Token>> next_tokens(tokens.size());
+    for (size_t stream = 0; stream < tokens.size(); stream++) {
+      size_t distance_multiplier =
+          params.image_widths.size() > stream ? params.image_widths[stream] : 0;
+      const auto& in = tokens[stream];
+      auto& out = next_tokens[stream];
+      if (in.empty()) continue;
+      // Cumulative sum of bit costs.
+      sym_cost.resize(in.size() + 1);
+      sym_cost[0] = 0.0f;
+      for (size_t i = 0; i < in.size(); i++) {
+        uint32_t tok, nbits, unused_bits;
+        uint_config.Encode(in[i].value, &tok, &nbits, &unused_bits);
+        sym_cost[i + 1] = sce.Bits(in[i].context, tok) + nbits + sym_cost[i];
       }
-      if (skip_lz77 > 0) {
-        skip_lz77--;
-        continue;
+
+      out.reserve(in.size());
+      size_t max_distance = std::min(in.size(), kWindowSize);
+      size_t min_length = lz77.min_length;
+      JXL_DASSERT(min_length >= 3);
+      size_t max_length = in.size();
+
+      // Use next power of two as window size.
+      size_t window_size = 1;
+      while (window_size < max_distance && window_size < kWindowSize) {
+        window_size <<= 1;
       }
-      dist_symbols.clear();
-      chain.FindMatches(i, max_distance,
-                        [&dist_symbols](size_t len, size_t dist_symbol) {
-                          if (dist_symbols.size() <= len) {
-                            dist_symbols.resize(len + 1, dist_symbol);
-                          }
-                          if (dist_symbol < dist_symbols[len]) {
-                            dist_symbols[len] = dist_symbol;
-                          }
-                        });
-      if (dist_symbols.size() <= min_length) {
-        rle_length = 0;
-        continue;
-      }
-      {
-        size_t best_cost = dist_symbols.back();
-        for (size_t j = dist_symbols.size() - 1; j >= min_length; j--) {
-          if (dist_symbols[j] < best_cost) {
-            best_cost = dist_symbols[j];
+
+      HashChain<kMaxChainLength> chain(in.data(), in.size(), window_size,
+                                       min_length, max_length,
+                                       distance_multiplier);
+
+      struct MatchInfo {
+        uint32_t len;
+        uint32_t dist_symbol;
+        uint32_t ctx;
+        float total_cost = std::numeric_limits<float>::max();
+      };
+      // Total cost to encode the first N symbols.
+      std::vector<MatchInfo> prefix_costs(in.size() + 1);
+      prefix_costs[0].total_cost = 0;
+
+      size_t rle_length = 0;
+      size_t skip_lz77 = 0;
+      size_t prev_match_end = 0;
+      size_t prev_match_dist = 0;
+      for (size_t i = 0; i < in.size(); i++) {
+        chain.Update(i);
+        float lit_cost =
+            prefix_costs[i].total_cost + sym_cost[i + 1] - sym_cost[i];
+        if (prefix_costs[i + 1].total_cost > lit_cost) {
+          prefix_costs[i + 1].dist_symbol = 0;
+          prefix_costs[i + 1].len = 1;
+          prefix_costs[i + 1].ctx = in[i].context;
+          prefix_costs[i + 1].total_cost = lit_cost;
+        }
+        if (skip_lz77 > 0) {
+          skip_lz77--;
+          continue;
+        }
+        dist_symbols.clear();
+        dist_costs.clear();
+        chain.FindMatches(
+            i, max_distance,
+            [&dist_symbols, &dist_costs, &sce, &lz77](size_t len,
+                                                      size_t dist_symbol) {
+              float dc = sce.DistCost(dist_symbol, lz77);
+              if (dist_symbols.size() <= len) {
+                dist_symbols.resize(len + 1, dist_symbol);
+                dist_costs.resize(len + 1, std::numeric_limits<float>::max());
+              }
+              if (dc < dist_costs[len] ||
+                  (dc == dist_costs[len] && dist_symbol < dist_symbols[len])) {
+                dist_costs[len] = dc;
+                dist_symbols[len] = dist_symbol;
+              }
+            });
+        if (dist_symbols.size() <= min_length) {
+          rle_length = 0;
+          continue;
+        }
+        {
+          uint32_t best_sym = dist_symbols.back();
+          float best_dc = dist_costs.back();
+          for (size_t j = dist_symbols.size() - 1; j >= min_length; j--) {
+            if (dist_costs[j] < best_dc ||
+                (dist_costs[j] == best_dc && dist_symbols[j] < best_sym)) {
+              best_dc = dist_costs[j];
+              best_sym = dist_symbols[j];
+            }
+            dist_costs[j] = best_dc;
+            dist_symbols[j] = best_sym;
           }
-          dist_symbols[j] = best_cost;
+        }
+        for (size_t j = min_length; j < dist_symbols.size(); j++) {
+          // Cost model that uses learned symbol/distance/length bit prices.
+          float lz77_cost =
+              sce.LenCost(in[i].context, j - min_length, lz77) + dist_costs[j];
+          float cost = prefix_costs[i].total_cost + lz77_cost;
+          if (prefix_costs[i + j].total_cost > cost) {
+            prefix_costs[i + j].len = j;
+            prefix_costs[i + j].dist_symbol = dist_symbols[j] + 1;
+            prefix_costs[i + j].ctx = in[i].context;
+            prefix_costs[i + j].total_cost = cost;
+          }
+        }
+        // We are in a RLE or long repeating sequence: skip all the symbols
+        // except the first 8 and the last 8. This avoids quadratic costs for
+        // sequences with long runs of repeating patterns.
+        const size_t cur_end = i + dist_symbols.size() - 1;
+        if (dist_symbols.back() == 0 ||
+            (dist_symbols.back() == 1 && distance_multiplier != 0) ||
+            (dist_symbols.size() > 256 && cur_end == prev_match_end &&
+             dist_symbols.back() == prev_match_dist)) {
+          rle_length++;
+        } else {
+          rle_length = 0;
+        }
+        prev_match_end = cur_end;
+        prev_match_dist = dist_symbols.back();
+        if (rle_length >= 8 && dist_symbols.size() > 9) {
+          skip_lz77 = dist_symbols.size() - 10;
+          rle_length = 0;
         }
       }
-      for (size_t j = min_length; j < dist_symbols.size(); j++) {
-        // Cost model that uses results from lazy LZ77.
-        float lz77_cost = sce.LenCost(in[i].context, j - min_length, lz77) +
-                          sce.DistCost(dist_symbols[j], lz77);
-        float cost = prefix_costs[i].total_cost + lz77_cost;
-        if (prefix_costs[i + j].total_cost > cost) {
-          prefix_costs[i + j].len = j;
-          prefix_costs[i + j].dist_symbol = dist_symbols[j] + 1;
-          prefix_costs[i + j].ctx = in[i].context;
-          prefix_costs[i + j].total_cost = cost;
+      size_t pos = in.size();
+      while (pos > 0) {
+        bool is_lz77_length = prefix_costs[pos].dist_symbol != 0;
+        if (is_lz77_length) {
+          size_t dist_symbol = prefix_costs[pos].dist_symbol - 1;
+          out.emplace_back(
+              static_cast<uint32_t>(lz77.nonserialized_distance_context),
+              static_cast<uint32_t>(dist_symbol));
         }
+        uint32_t val =
+            is_lz77_length
+                ? (prefix_costs[pos].len - static_cast<uint32_t>(min_length))
+                : in[pos - 1].value;
+        out.emplace_back(prefix_costs[pos].ctx, val);
+        out.back().is_lz77_length = is_lz77_length;
+        pos -= prefix_costs[pos].len;
       }
-      // We are in a RLE or long repeating sequence: skip all the symbols except
-      // the first 8 and the last 8. This avoids quadratic costs for sequences
-      // with long runs of repeating patterns.
-      const size_t cur_end = i + dist_symbols.size() - 1;
-      if (dist_symbols.back() == 0 ||
-          (dist_symbols.back() == 1 && distance_multiplier != 0) ||
-          (dist_symbols.size() > 256 && cur_end == prev_match_end &&
-           dist_symbols.back() == prev_match_dist)) {
-        rle_length++;
-      } else {
-        rle_length = 0;
-      }
-      prev_match_end = cur_end;
-      prev_match_dist = dist_symbols.back();
-      if (rle_length >= 8 && dist_symbols.size() > 9) {
-        skip_lz77 = dist_symbols.size() - 10;
-        rle_length = 0;
-      }
+      if (!out.empty()) std::reverse(out.begin(), out.end());
     }
-    size_t pos = in.size();
-    while (pos > 0) {
-      bool is_lz77_length = prefix_costs[pos].dist_symbol != 0;
-      if (is_lz77_length) {
-        size_t dist_symbol = prefix_costs[pos].dist_symbol - 1;
-        out.emplace_back(
-            static_cast<uint32_t>(lz77.nonserialized_distance_context),
-            static_cast<uint32_t>(dist_symbol));
-      }
-      uint32_t val =
-          is_lz77_length
-              ? (prefix_costs[pos].len - static_cast<uint32_t>(min_length))
-              : in[pos - 1].value;
-      out.emplace_back(prefix_costs[pos].ctx, val);
-      out.back().is_lz77_length = is_lz77_length;
-      pos -= prefix_costs[pos].len;
-    }
-    if (!out.empty()) std::reverse(out.begin(), out.end());
+    tokens_lz77 = std::move(next_tokens);
   }
   return tokens_lz77;
 }
