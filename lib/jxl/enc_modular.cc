@@ -405,8 +405,7 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       // also if the entropy (estimated bpp) is low (e.g. mostly solid/gradient
       // areas), palette is less useful and may even be counterproductive.
       if (cparams_.palette_colors < 0) {
-        if (zero_pred_mode && cparams_.speed_tier < SpeedTier::kSquirrel &&
-            nb_chans <= 3) {
+        if (cparams_.speed_tier < SpeedTier::kSquirrel && nb_chans <= 3) {
           maybe_palette.nb_colors =
               std::min(static_cast<int>(nb_pixels / 2), 1 << 10);
         } else {
