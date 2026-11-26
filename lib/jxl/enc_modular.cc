@@ -378,7 +378,12 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
     } else {
       cost_before = nb_pixels * arbitrary_bpp_estimate;
     }
-    const bool zero_pred_mode = (cparams_.options.predictor == Predictor::Zero);
+    // Efforts <= 3 (kFalcon and faster) force fixed WP/Gradient trees and
+    // ignore Predictor::Zero, so only use zero-predictor palette ordering when
+    // Predictor::Zero will actually be used.
+    const bool zero_pred_mode =
+        (cparams_.options.predictor == Predictor::Zero) &&
+        (cparams_.speed_tier < SpeedTier::kFalcon);
     // all-channel palette (e.g. RGBA)
     if (nb_chans > 1) {
       Transform maybe_palette(TransformId::kPalette);
@@ -389,8 +394,7 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       // Group palette: small tiles benefit less from large palettes due to
       // header overhead; also if the entropy (estimated bpp) is low (e.g.
       // mostly solid/gradient areas), palette is less useful.
-      if (is_global || zero_pred_mode ||
-          cparams_.speed_tier < SpeedTier::kSquirrel) {
+      if (is_global || cparams_.speed_tier < SpeedTier::kSquirrel) {
         maybe_palette.nb_colors = std::min(static_cast<int>(nb_pixels / 2),
                                            std::abs(cparams_.palette_colors));
       } else {
@@ -418,8 +422,7 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       Transform maybe_palette_3(TransformId::kPalette);
       maybe_palette_3.begin_c = gi.nb_meta_channels;
       maybe_palette_3.num_c = nb_chans - 1;
-      if (is_global || zero_pred_mode ||
-          cparams_.speed_tier < SpeedTier::kSquirrel) {
+      if (is_global || cparams_.speed_tier < SpeedTier::kSquirrel) {
         maybe_palette_3.nb_colors = std::min(static_cast<int>(nb_pixels / 3),
                                              std::abs(cparams_.palette_colors));
       } else {
